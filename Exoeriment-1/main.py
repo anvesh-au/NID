@@ -19,12 +19,13 @@ from sklearn.model_selection import train_test_split
 
 from rag_nids import RAGNIDS
 from rag_nids.data import class_weights, load_cic_ids2017
+from rag_nids.encoder import FlowEncoder
 from rag_nids.infer import evaluate, explain
 from rag_nids.lifecycle import (
     ensure_experiment, dataset_hash, log_and_register, mark_staging, promote_if_better,
     save_pipeline,
 )
-from rag_nids.train import build_index, train_encoder, train_head
+from rag_nids.train import build_index, pretrain_scarf, train_encoder, train_head
 
 
 def set_seed(seed: int) -> None:
@@ -61,6 +62,10 @@ def main():
     ap.add_argument("--loss_name", choices=["ce", "focal"], default="ce")
     ap.add_argument("--focal_gamma", type=float, default=2.0)
     ap.add_argument("--class_weighted_ce", action="store_true")
+    ap.add_argument("--scarf_epochs", type=int, default=0,
+                    help="SCARF pretraining epochs (0 disables)")
+    ap.add_argument("--scarf_corruption", type=float, default=0.6)
+    ap.add_argument("--scarf_temperature", type=float, default=0.5)
     ap.add_argument("--hnsw", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run_name", default="poc")
@@ -98,13 +103,25 @@ def main():
             w = counts.sum() / (num_classes * np.maximum(counts, 1))
             cw = torch.from_numpy(w)
 
-        print("[train] encoder")
+        init_encoder = None
+        if args.scarf_epochs > 0:
+            print("[scarf] pretraining encoder")
+            init_encoder = FlowEncoder(input_dim=X_tr.shape[1], embed_dim=args.embed_dim)
+            init_encoder = pretrain_scarf(
+                X_tr, init_encoder,
+                epochs=args.scarf_epochs, lr=args.enc_lr,
+                corruption_rate=args.scarf_corruption,
+                temperature=args.scarf_temperature,
+                device=args.device,
+            )
+
+        print("[train] encoder (SupCon fine-tune)" if init_encoder else "[train] encoder")
         encoder = train_encoder(
             X_tr, y_tr, num_classes=num_classes,
             embed_dim=args.embed_dim, epochs=args.enc_epochs, lr=args.enc_lr,
             supcon_weight=args.supcon_weight, ce_weight=args.ce_weight,
             temperature=args.temperature, device=args.device,
-            ce_class_weights=cw,
+            ce_class_weights=cw, init_encoder=init_encoder,
         )
 
         print("[index] building")

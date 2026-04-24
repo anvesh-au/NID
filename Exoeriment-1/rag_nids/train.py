@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 # pytorch-metric-learning: stable, well-tested contrastive losses — no reason to reimplement SupCon.
 from pytorch_metric_learning import losses
@@ -37,14 +38,81 @@ def _sampler(y: np.ndarray) -> WeightedRandomSampler:
     return WeightedRandomSampler(w, num_samples=len(w), replacement=True)
 
 
+def pretrain_scarf(
+    X: np.ndarray, encoder: FlowEncoder,
+    epochs: int = 10, batch_size: int = 512, lr: float = 1e-3,
+    corruption_rate: float = 0.6, temperature: float = 0.5,
+    device: str = "cpu",
+) -> FlowEncoder:
+    """SCARF self-supervised pretraining (Bahri et al., ICLR 2022).
+
+    Create two views of each flow by corrupting a random p% of features with
+    draws from each feature's marginal empirical distribution. Train the encoder
+    + a lightweight projection head with NT-Xent so both views align in latent space.
+    The projection head is discarded after pretraining.
+    """
+    encoder.train().to(device)
+    projector = nn.Sequential(
+        nn.Linear(encoder.embed_dim, encoder.embed_dim), nn.ReLU(),
+        nn.Linear(encoder.embed_dim, encoder.embed_dim),
+    ).to(device)
+
+    opt = torch.optim.AdamW(list(encoder.parameters()) + list(projector.parameters()),
+                            lr=lr, weight_decay=1e-4)
+
+    X_t = torch.from_numpy(X).to(device)         # full train set on device: cheap marginal sampling
+    N, D = X_t.shape
+    steps = max(1, N // batch_size)
+    col_idx = torch.arange(D, device=device)
+
+    for ep in range(epochs):
+        perm = torch.randperm(N, device=device)
+        total, n = 0.0, 0
+        for step in tqdm(range(steps), desc=f"scarf ep{ep+1}/{epochs}", leave=False):
+            idx = perm[step * batch_size:(step + 1) * batch_size]
+            x = X_t[idx]                                                         # (B, D)
+
+            # Corrupt p% of features with draws from each feature's marginal distribution
+            mask = torch.rand(x.size(0), D, device=device) < corruption_rate     # (B, D) bool
+            rand_rows = torch.randint(0, N, (x.size(0), D), device=device)       # (B, D)
+            corrupt = X_t[rand_rows, col_idx.expand_as(rand_rows)]               # (B, D)
+            x_corr = torch.where(mask, corrupt, x)
+
+            z1 = projector(encoder(x))
+            z2 = projector(encoder(x_corr))
+            z1 = F.normalize(z1, dim=-1); z2 = F.normalize(z2, dim=-1)
+
+            # NT-Xent: 2B samples, positives are (i, i+B)
+            z = torch.cat([z1, z2], dim=0)                                       # (2B, d)
+            sim = (z @ z.T) / temperature
+            sim.fill_diagonal_(-1e9)
+            B = x.size(0)
+            targets = torch.cat([torch.arange(B, 2 * B, device=device),
+                                 torch.arange(0, B, device=device)])
+            loss = F.cross_entropy(sim, targets)
+
+            opt.zero_grad(); loss.backward(); opt.step()
+            total += loss.item() * B; n += B
+
+        loss_avg = total / max(n, 1)
+        print(f"[scarf] ep {ep+1} ntxent_loss={loss_avg:.4f}")
+        if _active_run():
+            mlflow.log_metrics({"scarf/ntxent_loss": loss_avg}, step=ep)
+
+    return encoder
+
+
 def train_encoder(
     X: np.ndarray, y: np.ndarray, num_classes: int,
     embed_dim: int = 64, epochs: int = 20, batch_size: int = 512,
     lr: float = 1e-3, supcon_weight: float = 1.0, ce_weight: float = 0.3,
     temperature: float = 0.1, device: str = "cpu",
     ce_class_weights: Optional[torch.Tensor] = None,
+    init_encoder: Optional[FlowEncoder] = None,
 ) -> FlowEncoder:
-    encoder = FlowEncoder(input_dim=X.shape[1], embed_dim=embed_dim).to(device)
+    # FIX: accept a pre-initialized encoder (e.g. SCARF-pretrained) instead of always starting fresh
+    encoder = init_encoder if init_encoder is not None else FlowEncoder(input_dim=X.shape[1], embed_dim=embed_dim)
+    encoder = encoder.to(device)
     model = EncoderWithAuxHead(encoder, num_classes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
