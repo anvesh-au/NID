@@ -32,6 +32,16 @@ dist/
 *.log
 temps/
 
+# Dataset — large CSV files (>100MB, not suitable for GitHub without LFS)
+MachineLearningCVE/
+*.csv
+
+# MLflow tracking store and artifacts
+mlruns/
+
+# Misc
+cursor_explanations.txt
+
 # IDE/editor settings
 .vscode/
 .idea/
