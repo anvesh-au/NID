@@ -142,6 +142,93 @@ def explain(model: RAGNIDS, x: torch.Tensor, label_names: list[str],
                   f"label={label_names[p.neighbor_labels[j]]:<20}  sim={p.neighbor_sims[j]:.3f}")
 
 
+@torch.no_grad()
+def evaluate_two_stage(
+    two_stage, X: np.ndarray, y: np.ndarray, label_names: list[str],
+    benign_label: int, attack_class_names: list[str],
+    batch_size: int = 512, device: str = "cpu",
+    cm_out_dir: Optional[str] = None,
+) -> dict:
+    """Three-tier evaluation for the two-stage pipeline.
+
+    Tier 1 — Stage 1 binary (BENIGN vs attack): precision/recall/F1 of the VAE filter.
+    Tier 2 — Stage 2 attack-only classification on truly-flagged attacks: macro-F1
+             over the attack label space (uses ground-truth attack mask, ignores Stage 1
+             misses; this isolates Stage 2 quality).
+    Tier 3 — End-to-end N-class classification: macro-F1 over the original label space.
+             A Stage 1 false negative collapses to BENIGN regardless of true class.
+    """
+    out = two_stage.predict_array(X, batch_size=batch_size, device=device)
+    preds = out["preds"]
+    scores = out["stage1_scores"]
+    flagged = out["stage1_attack"]
+
+    is_attack = (y != benign_label)
+
+    # ----- Tier 1: Stage 1 binary -----
+    tp = int((flagged & is_attack).sum())
+    fp = int((flagged & ~is_attack).sum())
+    fn = int((~flagged & is_attack).sum())
+    tn = int((~flagged & ~is_attack).sum())
+    s1_prec = tp / max(tp + fp, 1)
+    s1_rec = tp / max(tp + fn, 1)
+    s1_f1 = 2 * s1_prec * s1_rec / max(s1_prec + s1_rec, 1e-9)
+    print(f"\n[stage1] binary: prec={s1_prec:.4f}  rec={s1_rec:.4f}  f1={s1_f1:.4f}  "
+          f"(tp={tp} fp={fp} fn={fn} tn={tn})")
+
+    # ----- Tier 2: Stage 2 attack-only on truly-attack rows that Stage 1 forwarded -----
+    # We need Stage 2 predictions on the GROUND-TRUTH attack rows, not just flagged ones,
+    # to fairly score the classifier. Re-run Stage 2 on every true-attack row.
+    s2_macro_f1 = float("nan")
+    s2_report_lines = []
+    if is_attack.any():
+        atk_idx = np.where(is_attack)[0]
+        X_atk = X[atk_idx]
+        two_stage.stage2.eval().to(device)
+        chunks = []
+        for i in range(0, len(X_atk), batch_size):
+            xb = torch.from_numpy(X_atk[i:i + batch_size]).to(device)
+            logits, *_ = two_stage.stage2(xb, exclude_self=False)
+            chunks.append(logits.argmax(-1).cpu().numpy())
+        s2_preds_attack_space = np.concatenate(chunks)
+
+        # y_atk in attack-only label space
+        lut = two_stage._lut.cpu().numpy()
+        # Build the inverse: original label -> new label (skip benign)
+        orig_to_new = {int(lut[i]): i for i in range(len(lut)) if lut[i] >= 0}
+        y_atk_new = np.array([orig_to_new[int(v)] for v in y[atk_idx]], dtype=np.int64)
+
+        s2_macro_f1 = f1_score(y_atk_new, s2_preds_attack_space,
+                               average="macro", zero_division=0)
+        print(f"\n[stage2] attack-only macro-F1: {s2_macro_f1:.4f}")
+        report = classification_report(y_atk_new, s2_preds_attack_space,
+                                       target_names=attack_class_names,
+                                       digits=4, zero_division=0)
+        print(report)
+        s2_report_lines = report.splitlines()
+
+    # ----- Tier 3: End-to-end N-class -----
+    macro_f1 = f1_score(y, preds, average="macro", zero_division=0)
+    print(f"\n[two-stage] end-to-end N-class macro-F1: {macro_f1:.4f}")
+    e2e_report = classification_report(y, preds, target_names=label_names,
+                                       digits=4, zero_division=0)
+    print(e2e_report)
+
+    cm = confusion_matrix(y, preds, label_names, out_dir=cm_out_dir)
+
+    metrics = {
+        "stage1_precision": s1_prec, "stage1_recall": s1_rec, "stage1_f1": s1_f1,
+        "stage1_tp": tp, "stage1_fp": fp, "stage1_fn": fn, "stage1_tn": tn,
+        "stage2_macro_f1": s2_macro_f1,
+        "e2e_macro_f1": macro_f1,
+    }
+    return {
+        "macro_f1": macro_f1, "preds": preds, "trues": y,
+        "stage1_scores": scores, "stage1_flagged": flagged,
+        "metrics": metrics, "confusion": cm,
+    }
+
+
 def run_writeback(model: RAGNIDS, x: torch.Tensor, pred, attack_class_ids: set[int],
                   min_confidence: float = 0.95) -> bool:
     """Add a high-confidence attack prediction to the index."""
