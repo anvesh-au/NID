@@ -4,12 +4,14 @@ MLflow is called when an active run is present; otherwise these functions run un
 """
 from __future__ import annotations
 
+import copy
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
 # pytorch-metric-learning: stable, well-tested contrastive losses — no reason to reimplement SupCon.
 from pytorch_metric_learning import losses
 from sklearn.metrics import f1_score
@@ -109,6 +111,8 @@ def train_encoder(
     temperature: float = 0.1, device: str = "cpu",
     ce_class_weights: Optional[torch.Tensor] = None,
     init_encoder: Optional[FlowEncoder] = None,
+    patience: Optional[int] = None, min_delta: float = 1e-4,
+    val_frac: float = 0.1, seed: int = 0,
 ) -> FlowEncoder:
     # FIX: accept a pre-initialized encoder (e.g. SCARF-pretrained) instead of always starting fresh
     encoder = init_encoder if init_encoder is not None else FlowEncoder(input_dim=X.shape[1], embed_dim=embed_dim)
@@ -119,11 +123,25 @@ def train_encoder(
     supcon = losses.SupConLoss(temperature=temperature)
 
     cw = ce_class_weights.to(device) if ce_class_weights is not None else None
-    loader = DataLoader(CICDataset(X, y), batch_size=batch_size,
-                        sampler=_sampler(y), num_workers=0, drop_last=True)
 
-    model.train()
+    # Carve out a held-out validation slice from train — used for early stopping only,
+    # so we don't leak the test set. Stratified to keep rare classes representable.
+    if patience is not None and val_frac > 0:
+        X_fit, X_val, y_fit, y_val = train_test_split(
+            X, y, test_size=val_frac, stratify=y, random_state=seed,
+        )
+    else:
+        X_fit, y_fit, X_val, y_val = X, y, None, None
+
+    loader = DataLoader(CICDataset(X_fit, y_fit), batch_size=batch_size,
+                        sampler=_sampler(y_fit), num_workers=0, drop_last=True)
+
+    best_val = float("inf")
+    best_state = None
+    bad_epochs = 0
+
     for ep in range(epochs):
+        model.train()
         t_sup, t_ce, t_tot, n = 0.0, 0.0, 0.0, 0
         for xb, yb in tqdm(loader, desc=f"encoder ep{ep+1}/{epochs}", leave=False):
             xb, yb = xb.to(device), yb.to(device)
@@ -138,16 +156,71 @@ def train_encoder(
         sched.step()
 
         sup_avg, ce_avg, tot_avg = t_sup / n, t_ce / n, t_tot / n
-        print(f"[encoder] ep {ep+1} supcon={sup_avg:.4f} ce={ce_avg:.4f} total={tot_avg:.4f}")
+
+        # Validation pass (for early stopping only)
+        val_sup = val_ce = val_tot = float("nan")
+        if X_val is not None:
+            val_sup, val_ce, val_tot = _eval_encoder_loss(
+                model, X_val, y_val, supcon, cw,
+                supcon_weight, ce_weight, batch_size, device,
+            )
+
+        msg = f"[encoder] ep {ep+1} supcon={sup_avg:.4f} ce={ce_avg:.4f} total={tot_avg:.4f}"
+        if X_val is not None:
+            msg += f" | val_total={val_tot:.4f}"
+        print(msg)
+
         if _active_run():
-            mlflow.log_metrics({
+            metrics = {
                 "encoder/supcon_loss": sup_avg,
                 "encoder/ce_loss": ce_avg,
                 "encoder/total_loss": tot_avg,
                 "encoder/lr": sched.get_last_lr()[0],
-            }, step=ep)
+            }
+            if X_val is not None:
+                metrics["encoder/val_total_loss"] = val_tot
+                metrics["encoder/val_supcon_loss"] = val_sup
+                metrics["encoder/val_ce_loss"] = val_ce
+            mlflow.log_metrics(metrics, step=ep)
 
+        # Early stopping on val_total_loss
+        if patience is not None and X_val is not None:
+            if val_tot < best_val - min_delta:
+                best_val = val_tot
+                best_state = copy.deepcopy(encoder.state_dict())
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    print(f"[encoder] early stop @ ep {ep+1}  best val_total={best_val:.4f}")
+                    break
+
+    if best_state is not None:
+        encoder.load_state_dict(best_state)
     return encoder
+
+
+@torch.no_grad()
+def _eval_encoder_loss(model, X, y, supcon, cw, supcon_weight, ce_weight,
+                       batch_size, device) -> Tuple[float, float, float]:
+    """Mean supcon/ce/total on a held-out slice. Uses the same weighted sum as training."""
+    model.eval()
+    t_sup = t_ce = t_tot = 0.0
+    n = 0
+    # Batch large enough to give SupCon useful positives/negatives
+    for i in range(0, len(X), batch_size):
+        xb = torch.from_numpy(X[i:i + batch_size]).to(device)
+        yb = torch.from_numpy(y[i:i + batch_size]).long().to(device)
+        if xb.size(0) < 2:
+            continue
+        z, logits = model(xb)
+        l_sup = supcon(z, yb)
+        l_ce = F.cross_entropy(logits, yb, weight=cw)
+        loss = supcon_weight * l_sup + ce_weight * l_ce
+        bs = xb.size(0)
+        t_sup += l_sup.item() * bs; t_ce += l_ce.item() * bs
+        t_tot += loss.item() * bs; n += bs
+    return t_sup / max(n, 1), t_ce / max(n, 1), t_tot / max(n, 1)
 
 
 @torch.no_grad()
@@ -187,6 +260,7 @@ def train_head(
     ce_class_weights: Optional[torch.Tensor] = None,
     loss_name: str = "ce",   # "ce" | "focal"
     focal_gamma: float = 2.0,
+    patience: Optional[int] = None, min_delta: float = 1e-4,
 ) -> CrossAttentionHead:
     head = CrossAttentionHead(encoder.embed_dim, num_classes, n_heads=n_heads).to(device)
     model = RAGNIDS(encoder, head, index, k=k).to(device)
@@ -209,8 +283,12 @@ def train_head(
             return ((1 - pt) ** focal_gamma * ce).mean()
         return F.cross_entropy(logits, targets, weight=cw)
 
-    head.train()
+    best_f1 = -float("inf")
+    best_state = None
+    bad_epochs = 0
+
     for ep in range(epochs):
+        head.train()
         total, correct, n = 0.0, 0, 0
         for xb, yb in tqdm(loader, desc=f"head ep{ep+1}/{epochs}", leave=False):
             xb, yb = xb.to(device), yb.to(device)
@@ -230,4 +308,18 @@ def train_head(
                 metrics["head/val_macro_f1"] = val_f1
             mlflow.log_metrics(metrics, step=ep)
 
+        # Early stopping on val_macro_f1 (maximize). Requires a val set.
+        if patience is not None and val is not None:
+            if val_f1 > best_f1 + min_delta:
+                best_f1 = val_f1
+                best_state = copy.deepcopy(head.state_dict())
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    print(f"[head] early stop @ ep {ep+1}  best val_macro_f1={best_f1:.4f}")
+                    break
+
+    if best_state is not None:
+        head.load_state_dict(best_state)
     return head

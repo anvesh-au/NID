@@ -67,10 +67,22 @@ def main():
     ap.add_argument("--scarf_corruption", type=float, default=0.6)
     ap.add_argument("--scarf_temperature", type=float, default=0.5)
     ap.add_argument("--hnsw", action="store_true")
+    ap.add_argument("--enc_patience", type=int, default=None,
+                    help="Early-stop encoder if val total-loss doesn't improve for N epochs (None=off)")
+    ap.add_argument("--head_patience", type=int, default=None,
+                    help="Early-stop head if val macro-F1 doesn't improve for N epochs (None=off)")
+    ap.add_argument("--enc_val_frac", type=float, default=0.1,
+                    help="Fraction of train carved out for encoder early-stopping val")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run_name", default="poc")
     ap.add_argument("--promote_threshold", type=float, default=0.80)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    def _default_device() -> str:
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    ap.add_argument("--device", default=_default_device())
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -122,6 +134,7 @@ def main():
             supcon_weight=args.supcon_weight, ce_weight=args.ce_weight,
             temperature=args.temperature, device=args.device,
             ce_class_weights=cw, init_encoder=init_encoder,
+            patience=args.enc_patience, val_frac=args.enc_val_frac, seed=args.seed,
         )
 
         print("[index] building")
@@ -135,28 +148,27 @@ def main():
             k=args.k, n_heads=args.n_heads, epochs=args.head_epochs, lr=args.head_lr,
             device=args.device, val=(X_te, y_te),
             ce_class_weights=cw, loss_name=args.loss_name, focal_gamma=args.focal_gamma,
+            patience=args.head_patience,
         )
 
         model = RAGNIDS(encoder, head, index, k=args.k).to(args.device)
 
         print("[eval] test set")
-        res = evaluate(model, X_te, y_te, label_names, device=args.device)
-        preds, trues = res["preds"], res["trues"]
-        macro_f1 = res["macro_f1"]
-
-        # Per-class F1 + confusion matrix artifacts
-        f1_per = f1_score(trues, preds, average=None, zero_division=0, labels=range(num_classes))
-        # FIX: sanitize class names — CIC-IDS2017 has non-ASCII chars (e.g. Web Attack \ufffd XSS)
-        # that mlflow rejects in metric keys.
-        def _clean(n: str) -> str:
-            return re.sub(r"[^A-Za-z0-9_\-. ]+", "_", n).strip("_")
-        for i, name in enumerate(label_names):
-            mlflow.log_metric(f"f1/{_clean(name)}", float(f1_per[i]))
-
         with tempfile.TemporaryDirectory() as tmp:
             import pandas as pd
-            pd.DataFrame(confusion_matrix(trues, preds, labels=range(num_classes)),
-                         index=label_names, columns=label_names).to_csv(f"{tmp}/confusion_matrix.csv")
+            res = evaluate(model, X_te, y_te, label_names, device=args.device,
+                           cm_out_dir=tmp)  # writes confusion_matrix_{counts,rates}.csv
+            preds, trues = res["preds"], res["trues"]
+            macro_f1 = res["macro_f1"]
+
+            # Per-class F1 — sanitize names for MLflow (rejects non-ASCII in metric keys).
+            f1_per = f1_score(trues, preds, average=None, zero_division=0,
+                              labels=range(num_classes))
+            def _clean(n: str) -> str:
+                return re.sub(r"[^A-Za-z0-9_\-. ]+", "_", n).strip("_")
+            for i, name in enumerate(label_names):
+                mlflow.log_metric(f"f1/{_clean(name)}", float(f1_per[i]))
+
             pd.DataFrame({"label": label_names, "f1": f1_per}).to_csv(
                 f"{tmp}/per_class_f1.csv", index=False)
             pd.DataFrame({"train": np.bincount(y_tr, minlength=num_classes),

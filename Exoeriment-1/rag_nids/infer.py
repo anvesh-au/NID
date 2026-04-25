@@ -1,18 +1,107 @@
 """Inference, evaluation, and retrieval-explanation printer."""
 from __future__ import annotations
 
+import os
+from typing import Optional
+
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import classification_report, confusion_matrix as sk_confusion_matrix, f1_score
 from torch.utils.data import DataLoader
 
 from .data import CICDataset
 from .pipeline import RAGNIDS
 
 
+def _display_order(label_names: list[str]) -> list[int]:
+    """Return indices into label_names sorted alphabetically, BENIGN first if present.
+
+    We reorder for display only — the sklearn confusion_matrix is computed over
+    integer labels 0..N-1, so we permute rows/cols of the resulting matrix.
+    """
+    order = sorted(range(len(label_names)), key=lambda i: label_names[i].lower())
+    benign_pos = next((p for p, i in enumerate(order) if label_names[i].upper() == "BENIGN"), None)
+    if benign_pos is not None and benign_pos != 0:
+        order = [order[benign_pos]] + [i for p, i in enumerate(order) if p != benign_pos]
+    return order
+
+
+def confusion_matrix(
+    trues: np.ndarray, preds: np.ndarray, label_names: list[str],
+    out_dir: Optional[str] = None, top_k_mistakes: int = 3,
+) -> dict:
+    """Full N×N confusion matrix report.
+
+    Prints raw counts + row-normalized rates (per-class recall) and the top-K
+    most common misclassification pairs. Optionally writes two CSVs to out_dir:
+    confusion_matrix_counts.csv and confusion_matrix_rates.csv.
+
+    Class ordering: alphabetical with BENIGN first. The same ordering is used
+    for both printed output and CSVs so delta matrices (run B minus run A) are
+    trivially computable.
+
+    Returns a dict with keys: counts (DataFrame), rates (DataFrame),
+    top_misclassifications (list of (true, pred, count, rate_of_true) tuples).
+    """
+    num_classes = len(label_names)
+    # Compute over all class indices 0..N-1 so absent labels still produce zero rows/cols.
+    cm = sk_confusion_matrix(trues, preds, labels=range(num_classes))
+
+    order = _display_order(label_names)
+    names = [label_names[i] for i in order]
+    cm_ord = cm[np.ix_(order, order)]
+
+    counts_df = pd.DataFrame(cm_ord, index=names, columns=names)
+    counts_df.index.name = "true"
+    counts_df.columns.name = "pred"
+
+    row_sums = cm_ord.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rates = np.where(row_sums > 0, cm_ord / np.maximum(row_sums, 1), 0.0)
+    rates_df = pd.DataFrame(rates, index=names, columns=names).round(4)
+    rates_df.index.name = "true"
+    rates_df.columns.name = "pred"
+
+    # Find top-K off-diagonal cells by absolute count
+    off_diag = cm_ord.copy().astype(np.int64)
+    np.fill_diagonal(off_diag, 0)
+    flat_idx = np.argsort(off_diag, axis=None)[::-1][:top_k_mistakes]
+    top_pairs = []
+    for flat in flat_idx:
+        i, j = np.unravel_index(flat, off_diag.shape)
+        count = int(off_diag[i, j])
+        if count == 0:
+            continue
+        true_total = int(row_sums[i, 0])
+        rate = count / true_total if true_total > 0 else 0.0
+        top_pairs.append((names[i], names[j], count, rate))
+
+    # Print
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", num_classes + 2)
+    print("\n[confusion matrix] raw counts (rows=true, cols=pred):")
+    print(counts_df.to_string())
+    print("\n[confusion matrix] row-normalized rates (per-class recall):")
+    print(rates_df.to_string())
+    print("\n[confusion matrix] top misclassifications:")
+    for true_name, pred_name, count, rate in top_pairs:
+        print(f"  {true_name} mistaken for {pred_name}: {count} times "
+              f"({rate:.1%} of {true_name}'s test samples)")
+
+    # Optional: persist to disk
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        counts_df.to_csv(os.path.join(out_dir, "confusion_matrix_counts.csv"))
+        rates_df.to_csv(os.path.join(out_dir, "confusion_matrix_rates.csv"))
+
+    return {"counts": counts_df, "rates": rates_df, "top_misclassifications": top_pairs}
+
+
 @torch.no_grad()
 def evaluate(model: RAGNIDS, X: np.ndarray, y: np.ndarray,
-             label_names: list[str], batch_size: int = 512, device: str = "cpu") -> dict:
+             label_names: list[str], batch_size: int = 512, device: str = "cpu",
+             cm_out_dir: Optional[str] = None) -> dict:
     model.eval().to(device)
     loader = DataLoader(CICDataset(X, y), batch_size=batch_size, shuffle=False)
     preds, trues = [], []
@@ -27,7 +116,12 @@ def evaluate(model: RAGNIDS, X: np.ndarray, y: np.ndarray,
                                    digits=4, zero_division=0)
     print(report)
     print(f"macro-F1: {macro_f1:.4f}")
-    return {"macro_f1": macro_f1, "preds": preds, "trues": trues}
+
+    # Always produce the full N×N confusion matrix report. Keeps plumbing in one
+    # place so initial POC runs and improvement reruns produce comparable CSVs.
+    cm = confusion_matrix(trues, preds, label_names, out_dir=cm_out_dir)
+
+    return {"macro_f1": macro_f1, "preds": preds, "trues": trues, "confusion": cm}
 
 
 @torch.no_grad()
