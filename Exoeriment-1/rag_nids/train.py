@@ -133,7 +133,13 @@ def train_encoder(
     else:
         X_fit, y_fit, X_val, y_val = X, y, None, None
 
-    loader = DataLoader(CICDataset(X_fit, y_fit), batch_size=batch_size,
+    # Guard against tiny datasets: drop_last=True with batch_size > len(X_fit)
+    # yields zero batches and a downstream ZeroDivisionError. Shrink to fit.
+    eff_batch = min(batch_size, max(2, len(X_fit) // 2))
+    if eff_batch < batch_size:
+        print(f"[encoder] shrinking batch_size {batch_size} -> {eff_batch} "
+              f"(only {len(X_fit)} train samples)")
+    loader = DataLoader(CICDataset(X_fit, y_fit), batch_size=eff_batch,
                         sampler=_sampler(y_fit), num_workers=0, drop_last=True)
 
     best_val = float("inf")
@@ -270,7 +276,11 @@ def train_head(
         p.requires_grad = False
 
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
-    loader = DataLoader(CICDataset(X, y), batch_size=batch_size,
+    eff_batch = min(batch_size, max(2, len(X) // 2))
+    if eff_batch < batch_size:
+        print(f"[head] shrinking batch_size {batch_size} -> {eff_batch} "
+              f"(only {len(X)} train samples)")
+    loader = DataLoader(CICDataset(X, y), batch_size=eff_batch,
                         sampler=_sampler(y), num_workers=0, drop_last=True)
     cw = ce_class_weights.to(device) if ce_class_weights is not None else None
 

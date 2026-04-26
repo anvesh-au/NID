@@ -82,10 +82,15 @@ def _run_two_stage(args, X_tr, y_tr, X_te, y_te, label_names, label_enc,
     X_val, y_val = X_tr[val_idx], y_tr[val_idx]
     print(f"[stage1] calibrating θ on val slice (n={len(X_val)}) "
           f"target_recall={args.vae_threshold_recall}")
+    print(f"[stage1] θ-calibration objective={args.vae_threshold_objective} "
+          f"min_recall={args.vae_threshold_min_recall} target_recall={args.vae_threshold_recall}")
     threshold, s1_metrics = calibrate_threshold(
         vae, X_val, y_val, benign_label=benign_label,
         target_recall=args.vae_threshold_recall, beta=args.vae_beta,
         device=args.device,
+        objective=args.vae_threshold_objective,
+        min_recall=args.vae_threshold_min_recall,
+        n_grid=args.vae_threshold_grid,
     )
     mlflow.log_metrics({k: float(v) for k, v in s1_metrics.items()
                         if isinstance(v, (int, float))})
@@ -237,7 +242,13 @@ def main():
     ap.add_argument("--vae_batch_size", type=int, default=512)
     ap.add_argument("--vae_patience", type=int, default=None)
     ap.add_argument("--vae_threshold_recall", type=float, default=0.95,
-                    help="Target Stage-1 attack recall when calibrating θ")
+                    help="(objective=recall) Target Stage-1 attack recall")
+    ap.add_argument("--vae_threshold_objective", choices=["f1", "recall"], default="f1",
+                    help="θ calibration objective: max binary macro-F1 (with recall floor) or fixed recall")
+    ap.add_argument("--vae_threshold_min_recall", type=float, default=0.80,
+                    help="(objective=f1) Minimum attack recall floor when sweeping θ for F1")
+    ap.add_argument("--vae_threshold_grid", type=int, default=200,
+                    help="(objective=f1) Number of θ candidates to sweep")
     def _default_device() -> str:
         if torch.cuda.is_available():
             return "cuda"

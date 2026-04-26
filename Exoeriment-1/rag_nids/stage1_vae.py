@@ -199,11 +199,15 @@ def compute_anomaly_scores(vae: FlowVAE, X: np.ndarray, beta: float = 1.0,
 def calibrate_threshold(
     vae: FlowVAE, X_val: np.ndarray, y_val: np.ndarray, benign_label: int,
     target_recall: float = 0.95, beta: float = 1.0, device: str = "cpu",
+    objective: str = "f1", min_recall: float = 0.80, n_grid: int = 200,
 ) -> Tuple[float, dict]:
-    """Pick θ on a labelled mixed val slice that achieves `target_recall` on attacks.
+    """Pick θ on a labelled mixed val slice.
 
-    Strategy: rank all val samples by anomaly score descending; choose θ s.t. the
-    top-fraction captures >=target_recall of true attacks. Returns (θ, metrics).
+    Two objectives:
+      - "recall": original behaviour — smallest θ that achieves ≥target_recall.
+      - "f1":    sweep θ over the score distribution and pick the value that
+                 maximises binary macro-F1 (BENIGN vs attack), subject to a
+                 `min_recall` floor so rare attacks don't get sacrificed.
     """
     scores = compute_anomaly_scores(vae, X_val, beta=beta, device=device)
     is_attack = (y_val != benign_label)
@@ -211,10 +215,41 @@ def calibrate_threshold(
     if n_attacks == 0:
         raise ValueError("Val set has zero attack samples — cannot calibrate threshold.")
 
-    # Sort attack scores descending; pick the score at the target_recall percentile
-    attack_scores = np.sort(scores[is_attack])[::-1]
-    k = max(1, int(np.ceil(target_recall * n_attacks)))
-    threshold = float(attack_scores[k - 1])
+    if objective == "recall":
+        attack_scores = np.sort(scores[is_attack])[::-1]
+        k = max(1, int(np.ceil(target_recall * n_attacks)))
+        threshold = float(attack_scores[k - 1])
+    elif objective == "f1":
+        # Sweep candidate thresholds along QUANTILES of the score distribution,
+        # not raw values — anomaly scores are heavy-tailed, and a uniform
+        # linspace would concentrate candidates in the empty outlier tail and
+        # miss the dense decision band entirely.
+        qs = np.linspace(0.0, 1.0, n_grid)
+        cands = np.quantile(scores, qs)
+        # Deduplicate (heavy ties at the low end inflate redundancy)
+        cands = np.unique(cands)
+        best_f1, threshold = -1.0, float(cands[0])
+        for t in cands:
+            pa = scores >= t
+            tp = int((pa & is_attack).sum())
+            fp = int((pa & ~is_attack).sum())
+            fn = int((~pa & is_attack).sum())
+            tn = int((~pa & ~is_attack).sum())
+            rec = tp / max(tp + fn, 1)
+            if rec < min_recall:
+                continue
+            # Binary macro-F1 (mean of attack-F1 and BENIGN-F1) — penalises
+            # both BENIGN false-positives and missed attacks symmetrically.
+            prec_a = tp / max(tp + fp, 1)
+            f1_a = 2 * prec_a * rec / max(prec_a + rec, 1e-9)
+            prec_b = tn / max(tn + fn, 1)
+            rec_b = tn / max(tn + fp, 1)
+            f1_b = 2 * prec_b * rec_b / max(prec_b + rec_b, 1e-9)
+            f1 = 0.5 * (f1_a + f1_b)
+            if f1 > best_f1:
+                best_f1, threshold = f1, float(t)
+    else:
+        raise ValueError(f"Unknown objective: {objective!r}")
 
     pred_attack = scores >= threshold
     tp = int((pred_attack & is_attack).sum())
