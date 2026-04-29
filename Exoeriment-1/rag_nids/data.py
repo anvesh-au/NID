@@ -87,32 +87,3 @@ def class_weights(y: np.ndarray) -> torch.Tensor:
     counts = np.bincount(y)
     w = 1.0 / np.maximum(counts, 1)
     return torch.from_numpy(w[y].astype(np.float32))
-
-
-# ---------------------------------------------------------------- two-stage helpers
-def split_benign_attack(
-    X: np.ndarray, y: np.ndarray, benign_label: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Split (X, y) into BENIGN-only features and attack (X, y) pair.
-
-    Returns (X_benign, X_attack, y_attack). Stage 1 trains on X_benign;
-    Stage 2 trains on (X_attack, remap(y_attack)).
-    """
-    is_b = (y == benign_label)
-    return X[is_b], X[~is_b], y[~is_b]
-
-
-def remap_attack_labels(
-    y_attack: np.ndarray, original_classes: list[str], benign_label: int,
-) -> Tuple[np.ndarray, list[str], dict]:
-    """Drop BENIGN from the label space; remap remaining labels to 0..N-2.
-
-    Returns (y_remapped, attack_class_names, orig_to_new_map). orig_to_new_map
-    is a dict mapping original integer label -> new integer label. BENIGN is
-    deliberately omitted from the map.
-    """
-    attack_orig = [i for i in range(len(original_classes)) if i != benign_label]
-    orig_to_new = {orig: new for new, orig in enumerate(attack_orig)}
-    y_remap = np.array([orig_to_new[int(v)] for v in y_attack], dtype=np.int64)
-    attack_names = [original_classes[i] for i in attack_orig]
-    return y_remap, attack_names, orig_to_new
