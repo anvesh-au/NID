@@ -19,6 +19,7 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
 from rag_nids import RAGNIDS
+from rag_nids.continual import run_continual_sessions
 from rag_nids.data import class_weights, load_cic_ids2017
 from rag_nids.encoder import FlowEncoder
 from rag_nids.infer import evaluate, explain
@@ -61,7 +62,8 @@ def _pkg_versions() -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", required=True)
+    ap.add_argument("--data_dir", default=None,
+                    help="Directory containing CIC-IDS2017 CSVs for the single-session pipeline")
     ap.add_argument("--subsample", type=int, default=50_000,
                     help="Max rows to keep per run; use 0 for the full dataset")
     ap.add_argument("--test_size", type=float, default=0.2,
@@ -93,6 +95,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run_name", default="poc")
     ap.add_argument("--promote_threshold", type=float, default=0.80)
+    ap.add_argument("--session_manifest", default=None,
+                    help="JSON manifest describing continual-learning sessions")
+    ap.add_argument("--session_output_dir", default=None,
+                    help="Optional directory for per-session CSV artifacts")
+    ap.add_argument("--replay_per_class", type=int, default=50,
+                    help="Replay exemplars retained per class across sessions")
     ap.add_argument("--no_mlflow", action="store_true",
                     help="Disable MLflow tracking, artifact logging, and registry updates")
     def _default_device() -> str:
@@ -105,6 +113,8 @@ def main():
     ap.add_argument("--faiss_device", choices=["cpu", "cuda"], default="cpu",
                     help="FAISS index device. 'cuda' requires a GPU-enabled faiss build.")
     args = ap.parse_args()
+    if args.data_dir is None and args.session_manifest is None:
+        ap.error("either --data_dir or --session_manifest must be provided")
     subsample = None if args.subsample <= 0 else args.subsample
     use_mlflow = not args.no_mlflow
 
@@ -118,6 +128,35 @@ def main():
         if use_mlflow:
             mlflow.log_params(vars(args))
             mlflow.log_params({f"pkg.{k}": v for k, v in _pkg_versions().items()})
+
+        if args.session_manifest is not None:
+            results = run_continual_sessions(
+                args.session_manifest,
+                device=args.device,
+                test_size=args.test_size,
+                embed_dim=args.embed_dim,
+                k=args.k,
+                enc_epochs=args.enc_epochs,
+                head_epochs=args.head_epochs,
+                enc_lr=args.enc_lr,
+                head_lr=args.head_lr,
+                supcon_weight=args.supcon_weight,
+                ce_weight=args.ce_weight,
+                temperature=args.temperature,
+                n_heads=args.n_heads,
+                loss_name=args.loss_name,
+                focal_gamma=args.focal_gamma,
+                replay_per_class=args.replay_per_class,
+                enc_patience=args.enc_patience,
+                head_patience=args.head_patience,
+                seed=args.seed,
+                output_dir=args.session_output_dir,
+            )
+            print("[session] summary")
+            for r in results:
+                print(f"  {r.name}: acc={r.accuracy:.4f} prec={r.precision_macro:.4f} "
+                      f"rec={r.recall_macro:.4f} f1={r.f1_macro:.4f}")
+            return
 
         print(f"[data] loading {args.data_dir}")
         X, y, feats, scaler, label_enc = load_cic_ids2017(args.data_dir, subsample=subsample,

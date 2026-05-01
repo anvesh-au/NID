@@ -1,0 +1,19 @@
+{
+  "sessions": [
+    {
+      "name": "session_1",
+      "csv_dir": "/path/to/session_1_csvs",
+      "subsample": 50000
+    },
+    {
+      "name": "session_2",
+      "csv_dir": "/path/to/session_2_csvs",
+      "subsample": 50000
+    },
+    {
+      "name": "session_3",
+      "csv_dir": "/path/to/session_3_csvs",
+      "subsample": 50000
+    }
+  ]
+}
