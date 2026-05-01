@@ -2,17 +2,22 @@
   "sessions": [
     {
       "name": "session_1",
-      "csv_dir": "/path/to/session_1_csvs",
+      "csv_dir": "MachineLearningCVE/session_1",
       "subsample": 50000
     },
     {
       "name": "session_2",
-      "csv_dir": "/path/to/session_2_csvs",
+      "csv_dir": "MachineLearningCVE/session_2",
       "subsample": 50000
     },
     {
       "name": "session_3",
-      "csv_dir": "/path/to/session_3_csvs",
+      "csv_dir": "MachineLearningCVE/session_3",
+      "subsample": 50000
+    },
+    {
+      "name": "session_4",
+      "csv_dir": "MachineLearningCVE/session_4",
       "subsample": 50000
     }
   ]
