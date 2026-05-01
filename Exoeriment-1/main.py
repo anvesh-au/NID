@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from rag_nids import RAGNIDS
 from rag_nids.data import (
@@ -29,7 +30,7 @@ from rag_nids.lifecycle import (
 )
 from rag_nids.stage1_vae import calibrate_threshold, train_vae
 from rag_nids.train import build_index, pretrain_scarf, train_encoder, train_head
-from rag_nids.two_stage import TwoStageNIDS
+from rag_nids.two_stage import TwoStageNIDS, calibrate_stage2_reject_threshold
 
 
 def set_seed(seed: int) -> None:
@@ -153,9 +154,20 @@ def _run_two_stage(args, X_tr, y_tr, X_te, y_te, label_names, label_enc,
     )
 
     stage2 = RAGNIDS(encoder, head, index, k=args.k).to(args.device)
+    print("[stage2] calibrating benign rejection threshold")
+    stage2_reject_threshold, s2_reject_metrics = calibrate_stage2_reject_threshold(
+        vae=vae, stage2=stage2, X_val=X_val, y_val=y_val,
+        benign_label=benign_label, new_to_orig=new_to_orig,
+        stage1_threshold=threshold, beta=args.vae_beta,
+        device=args.device, n_grid=args.vae_threshold_grid,
+    )
+    mlflow.log_metrics({k: float(v) for k, v in s2_reject_metrics.items()
+                        if isinstance(v, (int, float)) and not np.isnan(v)})
+    print(f"[stage2] benign rejection threshold={stage2_reject_threshold:.4f}")
     two_stage = TwoStageNIDS(
         vae=vae, threshold=threshold, stage2=stage2,
         benign_label=benign_label, new_to_orig=new_to_orig, beta=args.vae_beta,
+        stage2_reject_threshold=stage2_reject_threshold,
     ).to(args.device)
 
     print("[two-stage] evaluating on test set")
@@ -192,6 +204,7 @@ def _run_two_stage(args, X_tr, y_tr, X_te, y_te, label_names, label_enc,
             benign_label=benign_label, new_to_orig=new_to_orig,
             vae_latent_dim=args.vae_latent_dim, vae_hidden=args.vae_hidden,
             vae_beta=args.vae_beta,
+            stage2_reject_threshold=stage2_reject_threshold,
         )
         uri = log_and_register_two_stage(art_dir, e2e_macro_f1=res["macro_f1"],
                                          register=True)
@@ -266,8 +279,8 @@ def main():
         mlflow.log_params({f"pkg.{k}": v for k, v in _pkg_versions().items()})
 
         print(f"[data] loading {args.data_dir}")
-        X, y, feats, scaler, label_enc = load_cic_ids2017(args.data_dir, subsample=args.subsample,
-                                                          seed=args.seed)
+        X, y, feats, label_enc = load_cic_ids2017(args.data_dir, subsample=args.subsample,
+                                                  seed=args.seed)
         label_names = list(label_enc.classes_)
         num_classes = len(label_names)
         print(f"[data] X={X.shape}  classes={num_classes}  -> {label_names}")
@@ -276,8 +289,11 @@ def main():
             "dataset_hash": dataset_hash(X, y), "dataset_rows": int(X.shape[0]),
         })
 
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2,
-                                                  stratify=y, random_state=args.seed)
+        X_tr_raw, X_te_raw, y_tr, y_te = train_test_split(X, y, test_size=0.2,
+                                                         stratify=y, random_state=args.seed)
+        scaler = StandardScaler().fit(X_tr_raw)
+        X_tr = scaler.transform(X_tr_raw).astype(np.float32)
+        X_te = scaler.transform(X_te_raw).astype(np.float32)
 
         # print(f"[data] X_tr={X_tr.shape}  y_tr={y_tr.shape}  X_te={X_te.shape}  y_te={y_te.shape}")
 

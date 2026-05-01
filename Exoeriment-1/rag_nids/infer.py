@@ -162,6 +162,7 @@ def evaluate_two_stage(
     preds = out["preds"]
     scores = out["stage1_scores"]
     flagged = out["stage1_attack"]
+    stage2_rejected = int(out.get("stage2_rejected", 0))
 
     is_attack = (y != benign_label)
 
@@ -220,6 +221,7 @@ def evaluate_two_stage(
         "stage1_precision": s1_prec, "stage1_recall": s1_rec, "stage1_f1": s1_f1,
         "stage1_tp": tp, "stage1_fp": fp, "stage1_fn": fn, "stage1_tn": tn,
         "stage2_macro_f1": s2_macro_f1,
+        "stage2_rejected": stage2_rejected,
         "e2e_macro_f1": macro_f1,
     }
     return {

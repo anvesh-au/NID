@@ -123,6 +123,7 @@ def save_two_stage_pipeline(
     n_attack_classes: int, attack_class_names: list[str],
     benign_label: int, new_to_orig: dict,
     vae_latent_dim: int, vae_hidden: int, vae_beta: float,
+    stage2_reject_threshold: float = 0.0,
 ) -> Path:
     """Persist every component needed to rebuild the two-stage pipeline."""
     d = Path(artifact_dir); d.mkdir(parents=True, exist_ok=True)
@@ -149,6 +150,7 @@ def save_two_stage_pipeline(
         "vae_hidden": vae_hidden,
         "vae_beta": vae_beta,
         "stage1_threshold": float(threshold),
+        "stage2_reject_threshold": float(stage2_reject_threshold),
     }))
     return d
 
@@ -178,6 +180,7 @@ class TwoStageWrapper(mlflow.pyfunc.PythonModel):
             vae=vae, threshold=cfg["stage1_threshold"], stage2=stage2,
             benign_label=cfg["benign_label"], new_to_orig=new_to_orig,
             beta=cfg["vae_beta"],
+            stage2_reject_threshold=cfg.get("stage2_reject_threshold", 0.0),
         ).eval()
 
         with open(root / "scaler.pkl", "rb") as f:

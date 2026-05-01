@@ -1,6 +1,7 @@
 """CIC-IDS2017 loading & preprocessing.
 
-sklearn.preprocessing for StandardScaler + LabelEncoder — standard tabular stack, no custom impls.
+Label encoding happens here; feature scaling is fit later on the train split so
+test data does not leak into preprocessing statistics.
 """
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -28,8 +29,8 @@ def load_cic_ids2017(
     label_col: str = "Label",
     subsample: int | None = None,
     seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, list[str], StandardScaler, LabelEncoder]:
-    """Load all CIC-IDS2017 CSVs in `csv_dir`, return (X, y, feature_names, scaler, label_enc)."""
+) -> Tuple[np.ndarray, np.ndarray, list[str], LabelEncoder]:
+    """Load all CIC-IDS2017 CSVs in `csv_dir`, return (X, y, feature_names, label_enc)."""
     csv_dir = Path(csv_dir)
     files = sorted(csv_dir.glob("*.csv"))
     if not files:
@@ -61,13 +62,12 @@ def load_cic_ids2017(
     X_df = X_df.select_dtypes(include=[np.number]).astype(np.float32)
     feature_names = list(X_df.columns)
 
-    scaler = StandardScaler().fit(X_df.values)
-    X = scaler.transform(X_df.values).astype(np.float32)
+    X = X_df.values.astype(np.float32)
 
     label_enc = LabelEncoder().fit(y_raw)
     y = label_enc.transform(y_raw).astype(np.int64)
 
-    return X, y, feature_names, scaler, label_enc
+    return X, y, feature_names, label_enc
 
 
 class CICDataset(Dataset):
