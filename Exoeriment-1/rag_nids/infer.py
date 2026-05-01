@@ -112,7 +112,7 @@ def evaluate(model: RAGNIDS, X: np.ndarray, y: np.ndarray,
         trues.append(yb.numpy())
     preds = np.concatenate(preds); trues = np.concatenate(trues)
     macro_f1 = f1_score(trues, preds, average="macro", zero_division=0)
-    report = classification_report(trues, preds, target_names=label_names,
+    report = classification_report(trues, preds, labels=range(len(label_names)), target_names=label_names,
                                    digits=4, zero_division=0)
     print(report)
     print(f"macro-F1: {macro_f1:.4f}")
@@ -143,12 +143,12 @@ def explain(model: RAGNIDS, x: torch.Tensor, label_names: list[str],
 
 
 def run_writeback(model: RAGNIDS, x: torch.Tensor, pred, attack_class_ids: set[int],
-                  min_confidence: float = 0.95) -> bool:
+                  min_confidence: float = 0.95, session_id: int | None = None) -> bool:
     """Add a high-confidence attack prediction to the index."""
     with torch.no_grad():
         z = model.encoder(x.unsqueeze(0)).cpu().numpy()[0]
     return model.index.writeback(
         embedding=z, label=pred.label,
         min_confidence=min_confidence, confidence=pred.confidence,
-        is_attack=pred.label in attack_class_ids,
+        is_attack=pred.label in attack_class_ids, session_id=session_id,
     )

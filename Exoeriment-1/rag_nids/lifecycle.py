@@ -33,6 +33,7 @@ def _save_index(index: FlowIndex, path: Path) -> None:
     np.savez(path / "index_meta.npz",
              embeddings=index.embeddings,
              labels=index.labels, timestamps=index.timestamps, source=index.source,
+             session_ids=index.session_ids,
              use_hnsw=index.use_hnsw, faiss_device=index.faiss_device)
 
 
@@ -43,6 +44,8 @@ def _load_index(path: Path, embed_dim: int) -> FlowIndex:
     ix.index = faiss.read_index(str(path / "faiss.index"))
     ix.embeddings = meta["embeddings"] if "embeddings" in meta.files else ix.index.reconstruct_n(0, ix.index.ntotal)
     ix.labels = meta["labels"]; ix.timestamps = meta["timestamps"]; ix.source = meta["source"]
+    if "session_ids" in meta.files:
+        ix.session_ids = meta["session_ids"]
     return ix
 
 

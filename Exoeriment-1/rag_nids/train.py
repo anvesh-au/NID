@@ -232,7 +232,7 @@ def _eval_encoder_loss(model, X, y, supcon, cw, supcon_weight, ce_weight,
 @torch.no_grad()
 def build_index(encoder: FlowEncoder, X: np.ndarray, y: np.ndarray,
                 use_hnsw: bool = False, batch_size: int = 4096, device: str = "cpu",
-                faiss_device: str = "cpu") -> FlowIndex:
+                faiss_device: str = "cpu", session_ids: np.ndarray | None = None) -> FlowIndex:
     encoder.eval().to(device)
     embs = []
     for i in range(0, len(X), batch_size):
@@ -241,7 +241,7 @@ def build_index(encoder: FlowEncoder, X: np.ndarray, y: np.ndarray,
     embs = np.concatenate(embs, axis=0).astype(np.float32)
 
     index = FlowIndex(embed_dim=encoder.embed_dim, use_hnsw=use_hnsw, faiss_device=faiss_device)
-    index.add(embs, y)
+    index.add(embs, y, session_ids=session_ids)
     return index
 
 

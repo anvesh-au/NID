@@ -26,6 +26,7 @@ from rag_nids.lifecycle import (
     ensure_experiment, dataset_hash, log_and_register, mark_staging, promote_if_better,
     save_pipeline,
 )
+from rag_nids.session_pipeline import run_session_pipeline
 from rag_nids.train import build_index, pretrain_scarf, train_encoder, train_head
 
 
@@ -62,6 +63,7 @@ def _pkg_versions() -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
+    ap.add_argument("--pipeline_mode", choices=["standard", "sessions"], default="standard")
     ap.add_argument("--subsample", type=int, default=50_000,
                     help="Max rows to keep per run; use 0 for the full dataset")
     ap.add_argument("--test_size", type=float, default=0.2,
@@ -93,6 +95,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run_name", default="poc")
     ap.add_argument("--promote_threshold", type=float, default=0.80)
+    ap.add_argument("--train_days", type=int, default=2,
+                    help="For session mode: number of initial day sessions used for training")
+    ap.add_argument("--session_window_days", type=int, default=2,
+                    help="For session mode: retain only the last N sessions in the index")
+    ap.add_argument("--session_val_frac", type=float, default=0.1,
+                    help="For session mode: validation fraction carved from train days for head training")
+    ap.add_argument("--session_eval_batch_size", type=int, default=256,
+                    help="For session mode: streaming evaluation batch size")
+    ap.add_argument("--session_writeback_threshold", type=float, default=0.95,
+                    help="For session mode: min confidence required before a prediction is written back")
+    ap.add_argument("--session_report_dir", default=None,
+                    help="For session mode: directory where session reports and confusion matrices are saved")
     ap.add_argument("--no_mlflow", action="store_true",
                     help="Disable MLflow tracking, artifact logging, and registry updates")
     def _default_device() -> str:
@@ -118,6 +132,10 @@ def main():
         if use_mlflow:
             mlflow.log_params(vars(args))
             mlflow.log_params({f"pkg.{k}": v for k, v in _pkg_versions().items()})
+
+        if args.pipeline_mode == "sessions":
+            run_session_pipeline(args, use_mlflow=use_mlflow)
+            return
 
         print(f"[data] loading {args.data_dir}")
         X, y, feats, scaler, label_enc = load_cic_ids2017(args.data_dir, subsample=subsample,

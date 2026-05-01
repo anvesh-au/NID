@@ -33,6 +33,7 @@ class FlowIndex:
         self.embeddings = np.empty((0, embed_dim), dtype=np.float32)
         self.labels = np.empty(0, dtype=np.int32)
         self.timestamps = np.empty(0, dtype=np.float64)
+        self.session_ids = np.empty(0, dtype=np.int32)
         self.source = np.empty(0, dtype=np.int8)
         self.ttl = ttl_seconds
         self.max_writeback = max_writeback
@@ -68,13 +69,22 @@ class FlowIndex:
         return self.index
 
     # ---- building ----
-    def add(self, embeddings: np.ndarray, labels: np.ndarray, source: int = PINNED):
+    def add(self, embeddings: np.ndarray, labels: np.ndarray, source: int = PINNED,
+            session_ids: np.ndarray | int | None = None):
         embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
+        labels = labels.astype(np.int32)
+        if session_ids is None:
+            session_ids_arr = np.full(len(labels), -1, dtype=np.int32)
+        elif np.isscalar(session_ids):
+            session_ids_arr = np.full(len(labels), int(session_ids), dtype=np.int32)
+        else:
+            session_ids_arr = np.asarray(session_ids, dtype=np.int32)
         self.index.add(embeddings)
         self.embeddings = np.concatenate([self.embeddings, embeddings], axis=0)
-        self.labels = np.concatenate([self.labels, labels.astype(np.int32)])
+        self.labels = np.concatenate([self.labels, labels])
         now = time.time()
         self.timestamps = np.concatenate([self.timestamps, np.full(len(labels), now)])
+        self.session_ids = np.concatenate([self.session_ids, session_ids_arr])
         self.source = np.concatenate([self.source, np.full(len(labels), source, dtype=np.int8)])
 
     # ---- query ----
@@ -93,10 +103,10 @@ class FlowIndex:
 
     # ---- write-back ----
     def writeback(self, embedding: np.ndarray, label: int, min_confidence: float,
-                  confidence: float, is_attack: bool):
+                  confidence: float, is_attack: bool, session_id: int | None = None):
         if not (is_attack and confidence >= min_confidence):
             return False
-        self.add(embedding[None, :], np.array([label]), source=WRITEBACK)
+        self.add(embedding[None, :], np.array([label]), source=WRITEBACK, session_ids=session_id)
         self._cap_writeback()
         return True
 
@@ -117,6 +127,15 @@ class FlowIndex:
         if expired.any():
             self._rebuild_dropping(np.where(expired)[0])
 
+    def evict_sessions_before(self, min_session_id: int) -> int:
+        if self.session_ids.size == 0:
+            return 0
+        stale = (self.session_ids >= 0) & (self.session_ids < min_session_id)
+        removed = int(stale.sum())
+        if removed:
+            self._rebuild_dropping(np.where(stale)[0])
+        return removed
+
     def _rebuild_dropping(self, drop_indices: np.ndarray):
         """FAISS IndexFlat doesn't support remove_ids cleanly for HNSW — rebuild."""
         keep = np.ones(self.labels.size, dtype=bool)
@@ -128,6 +147,7 @@ class FlowIndex:
         self.embeddings = kept_emb
         self.labels = self.labels[keep]
         self.timestamps = self.timestamps[keep]
+        self.session_ids = self.session_ids[keep]
         self.source = self.source[keep]
 
     def stats(self) -> IndexStats:
