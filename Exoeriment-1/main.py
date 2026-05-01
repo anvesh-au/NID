@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--subsample", type=int, default=50_000,
                     help="Max rows to keep per run; use 0 for the full dataset")
+    ap.add_argument("--test_size", type=float, default=0.2,
+                    help="Fraction of the dataset reserved for the test split")
     ap.add_argument("--embed_dim", type=int, default=64)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--enc_epochs", type=int, default=10)
@@ -129,8 +131,9 @@ def main():
                 "dataset_hash": dataset_hash(X, y), "dataset_rows": int(X.shape[0]),
             })
 
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2,
-                                                  stratify=y, random_state=args.seed)
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=args.test_size, stratify=y, random_state=args.seed,
+        )
 
         cw = None
         if args.class_weighted_ce:
