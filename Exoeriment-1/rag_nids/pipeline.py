@@ -39,13 +39,9 @@ class RAGNIDS(nn.Module):
         return sims, idx, labels
 
     def _gather_neighbor_embeddings(self, idx: np.ndarray) -> torch.Tensor:
-        """Reconstruct neighbour embeddings from the FAISS index (batched)."""
-        # FIX: per-element reconstruct() in a Python loop was causing segfaults under
-        # threaded DataLoader/MLflow. reconstruct_batch does it in one C++ call.
-        flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
-        flat = np.where(flat >= 0, flat, 0)
-        vecs = self.index.index.reconstruct_batch(flat)
-        return torch.from_numpy(np.asarray(vecs)).reshape(*idx.shape, -1)
+        """Gather neighbour embeddings from cached vectors to support CPU and GPU FAISS."""
+        vecs = self.index.reconstruct_batch(idx)
+        return torch.from_numpy(np.asarray(vecs))
 
     def forward(self, x: torch.Tensor, exclude_self: bool = False):
         device = x.device

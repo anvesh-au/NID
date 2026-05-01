@@ -48,7 +48,7 @@ def log_device_status(device: str) -> None:
 
 
 def _pkg_versions() -> dict:
-    pkgs = ["torch", "numpy", "pandas", "scikit-learn", "faiss-cpu",
+    pkgs = ["torch", "numpy", "pandas", "scikit-learn", "faiss-cpu", "faiss-gpu",
             "pytorch-metric-learning", "mlflow"]
     out = {}
     for p in pkgs:
@@ -100,6 +100,8 @@ def main():
             return "mps"
         return "cpu"
     ap.add_argument("--device", default=_default_device())
+    ap.add_argument("--faiss_device", choices=["cpu", "cuda"], default="cpu",
+                    help="FAISS index device. 'cuda' requires a GPU-enabled faiss build.")
     args = ap.parse_args()
     subsample = None if args.subsample <= 0 else args.subsample
     use_mlflow = not args.no_mlflow
@@ -160,10 +162,15 @@ def main():
         )
 
         print("[index] building")
-        index = build_index(encoder, X_tr, y_tr, use_hnsw=args.hnsw, device=args.device)
+        print(f"[index] faiss_device={args.faiss_device}")
+        index = build_index(
+            encoder, X_tr, y_tr,
+            use_hnsw=args.hnsw, device=args.device, faiss_device=args.faiss_device,
+        )
         if use_mlflow:
             mlflow.log_params({"index_total": index.stats().total,
-                               "index_type": "hnsw" if args.hnsw else "flat"})
+                               "index_type": "hnsw" if args.hnsw else "flat",
+                               "faiss_device_effective": index.faiss_device})
 
         print("[train] cross-attention head")
         head = train_head(
