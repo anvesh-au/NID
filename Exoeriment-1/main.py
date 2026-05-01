@@ -34,6 +34,19 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 
+def log_device_status(device: str) -> None:
+    cuda_available = torch.cuda.is_available()
+    mps_available = torch.backends.mps.is_available()
+    print(f"[device] requested={device} torch.cuda.is_available()={cuda_available} "
+          f"torch.backends.mps.is_available()={mps_available}")
+    if device == "cuda" and not cuda_available:
+        print("[warning] CUDA was requested but is not available. Falling back may fail or run on CPU.")
+    elif cuda_available and device != "cuda":
+        print(f"[warning] CUDA is available but not selected; using '{device}' instead.")
+    elif not cuda_available and device == "cpu":
+        print("[warning] CUDA is not available; running on CPU.")
+
+
 def _pkg_versions() -> dict:
     pkgs = ["torch", "numpy", "pandas", "scikit-learn", "faiss-cpu",
             "pytorch-metric-learning", "mlflow"]
@@ -92,6 +105,7 @@ def main():
     use_mlflow = not args.no_mlflow
 
     set_seed(args.seed)
+    log_device_status(args.device)
     if use_mlflow:
         ensure_experiment()
 
