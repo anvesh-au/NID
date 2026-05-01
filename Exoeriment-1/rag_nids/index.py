@@ -1,7 +1,4 @@
-"""FAISS-backed flow index with write-back + TTL eviction.
-
-faiss-cpu: industry-standard ANN library; reimplementing HNSW/IVF is not a project worth starting.
-"""
+"""FAISS-backed flow index with write-back + TTL eviction."""
 import time
 from dataclasses import dataclass
 
@@ -20,24 +17,61 @@ class IndexStats:
     writeback: int
 
 
+def _faiss_gpu_available() -> bool:
+    return all(hasattr(faiss, name) for name in ("StandardGpuResources", "index_cpu_to_gpu"))
+
+
 class FlowIndex:
     def __init__(self, embed_dim: int, use_hnsw: bool = False, ttl_seconds: float = 7 * 24 * 3600,
-                 max_writeback: int = 200_000):
-        if use_hnsw:
-            self.index = faiss.IndexHNSWFlat(embed_dim, 32, faiss.METRIC_INNER_PRODUCT)
-            self.index.hnsw.efSearch = 64
-        else:
-            self.index = faiss.IndexFlatIP(embed_dim)
+                 max_writeback: int = 200_000, faiss_device: str = "cpu"):
+        self.embed_dim = embed_dim
+        self.use_hnsw = use_hnsw
+        self.faiss_device = "cpu"
+        self._gpu_resources = None
+        self.index = self._new_index()
+        self._set_faiss_device(faiss_device)
+        self.embeddings = np.empty((0, embed_dim), dtype=np.float32)
         self.labels = np.empty(0, dtype=np.int32)
         self.timestamps = np.empty(0, dtype=np.float64)
         self.source = np.empty(0, dtype=np.int8)
         self.ttl = ttl_seconds
         self.max_writeback = max_writeback
 
+    def _new_index(self):
+        if self.use_hnsw:
+            index = faiss.IndexHNSWFlat(self.embed_dim, 32, faiss.METRIC_INNER_PRODUCT)
+            index.hnsw.efSearch = 64
+            return index
+        return faiss.IndexFlatIP(self.embed_dim)
+
+    def _set_faiss_device(self, faiss_device: str) -> None:
+        if faiss_device == "cuda":
+            if not _faiss_gpu_available():
+                print("[warning] FAISS GPU was requested but this faiss build has no CUDA support; using CPU index.")
+                self.faiss_device = "cpu"
+                return
+            try:
+                self._gpu_resources = faiss.StandardGpuResources()
+                self.index = faiss.index_cpu_to_gpu(self._gpu_resources, 0, self.index)
+                self.faiss_device = "cuda"
+                print("[index] using FAISS GPU index on CUDA:0")
+            except Exception as exc:
+                self._gpu_resources = None
+                self.faiss_device = "cpu"
+                print(f"[warning] FAISS GPU was requested but could not be initialized ({exc}); using CPU index.")
+            return
+        self.faiss_device = "cpu"
+
+    def to_cpu_index(self):
+        if self.faiss_device == "cuda":
+            return faiss.index_gpu_to_cpu(self.index)
+        return self.index
+
     # ---- building ----
     def add(self, embeddings: np.ndarray, labels: np.ndarray, source: int = PINNED):
         embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
         self.index.add(embeddings)
+        self.embeddings = np.concatenate([self.embeddings, embeddings], axis=0)
         self.labels = np.concatenate([self.labels, labels.astype(np.int32)])
         now = time.time()
         self.timestamps = np.concatenate([self.timestamps, np.full(len(labels), now)])
@@ -52,6 +86,10 @@ class FlowIndex:
         safe_idx = np.where(idx >= 0, idx, 0)
         neighbor_labels = self.labels[safe_idx]
         return sims, idx, neighbor_labels
+
+    def reconstruct_batch(self, idx: np.ndarray) -> np.ndarray:
+        safe_idx = np.where(idx >= 0, idx, 0)
+        return self.embeddings[safe_idx]
 
     # ---- write-back ----
     def writeback(self, embedding: np.ndarray, label: int, min_confidence: float,
@@ -83,15 +121,11 @@ class FlowIndex:
         """FAISS IndexFlat doesn't support remove_ids cleanly for HNSW — rebuild."""
         keep = np.ones(self.labels.size, dtype=bool)
         keep[drop_indices] = False
-        all_emb = self.index.reconstruct_n(0, self.index.ntotal)
-        kept_emb = all_emb[keep]
-        d = self.index.d
-        is_hnsw = isinstance(self.index, faiss.IndexHNSWFlat)
-        self.index = (faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
-                      if is_hnsw else faiss.IndexFlatIP(d))
-        if is_hnsw:
-            self.index.hnsw.efSearch = 64
+        kept_emb = self.embeddings[keep]
+        self.index = self._new_index()
+        self._set_faiss_device(self.faiss_device)
         self.index.add(np.ascontiguousarray(kept_emb, dtype=np.float32))
+        self.embeddings = kept_emb
         self.labels = self.labels[keep]
         self.timestamps = self.timestamps[keep]
         self.source = self.source[keep]

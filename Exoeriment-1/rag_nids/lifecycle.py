@@ -29,15 +29,19 @@ REGISTERED_MODEL = "rag_nids_pipeline"
 
 # ---------------------------------------------------------------- artifact IO
 def _save_index(index: FlowIndex, path: Path) -> None:
-    faiss.write_index(index.index, str(path / "faiss.index"))
+    faiss.write_index(index.to_cpu_index(), str(path / "faiss.index"))
     np.savez(path / "index_meta.npz",
-             labels=index.labels, timestamps=index.timestamps, source=index.source)
+             embeddings=index.embeddings,
+             labels=index.labels, timestamps=index.timestamps, source=index.source,
+             use_hnsw=index.use_hnsw, faiss_device=index.faiss_device)
 
 
 def _load_index(path: Path, embed_dim: int) -> FlowIndex:
-    ix = FlowIndex(embed_dim=embed_dim)
-    ix.index = faiss.read_index(str(path / "faiss.index"))
     meta = np.load(path / "index_meta.npz")
+    use_hnsw = bool(meta["use_hnsw"]) if "use_hnsw" in meta.files else False
+    ix = FlowIndex(embed_dim=embed_dim, use_hnsw=use_hnsw, faiss_device="cpu")
+    ix.index = faiss.read_index(str(path / "faiss.index"))
+    ix.embeddings = meta["embeddings"] if "embeddings" in meta.files else ix.index.reconstruct_n(0, ix.index.ntotal)
     ix.labels = meta["labels"]; ix.timestamps = meta["timestamps"]; ix.source = meta["source"]
     return ix
 
