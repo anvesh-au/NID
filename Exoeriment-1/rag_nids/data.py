@@ -1,6 +1,7 @@
 """CIC-IDS2017 loading & preprocessing.
 
-sklearn.preprocessing for StandardScaler + LabelEncoder — standard tabular stack, no custom impls.
+Label encoding happens here; feature scaling is fit later on the train split so
+test data does not leak into preprocessing statistics.
 """
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -28,8 +29,8 @@ def load_cic_ids2017(
     label_col: str = "Label",
     subsample: int | None = None,
     seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, list[str], StandardScaler, LabelEncoder]:
-    """Load all CIC-IDS2017 CSVs in `csv_dir`, return (X, y, feature_names, scaler, label_enc)."""
+) -> Tuple[np.ndarray, np.ndarray, list[str], LabelEncoder]:
+    """Load all CIC-IDS2017 CSVs in `csv_dir`, return (X, y, feature_names, label_enc)."""
     csv_dir = Path(csv_dir)
     files = sorted(csv_dir.glob("*.csv"))
     if not files:
@@ -61,13 +62,12 @@ def load_cic_ids2017(
     X_df = X_df.select_dtypes(include=[np.number]).astype(np.float32)
     feature_names = list(X_df.columns)
 
-    scaler = StandardScaler().fit(X_df.values)
-    X = scaler.transform(X_df.values).astype(np.float32)
+    X = X_df.values.astype(np.float32)
 
     label_enc = LabelEncoder().fit(y_raw)
     y = label_enc.transform(y_raw).astype(np.int64)
 
-    return X, y, feature_names, scaler, label_enc
+    return X, y, feature_names, label_enc
 
 
 class CICDataset(Dataset):
@@ -87,3 +87,32 @@ def class_weights(y: np.ndarray) -> torch.Tensor:
     counts = np.bincount(y)
     w = 1.0 / np.maximum(counts, 1)
     return torch.from_numpy(w[y].astype(np.float32))
+
+
+# ---------------------------------------------------------------- two-stage helpers
+def split_benign_attack(
+    X: np.ndarray, y: np.ndarray, benign_label: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split (X, y) into BENIGN-only features and attack (X, y) pair.
+
+    Returns (X_benign, X_attack, y_attack). Stage 1 trains on X_benign;
+    Stage 2 trains on (X_attack, remap(y_attack)).
+    """
+    is_b = (y == benign_label)
+    return X[is_b], X[~is_b], y[~is_b]
+
+
+def remap_attack_labels(
+    y_attack: np.ndarray, original_classes: list[str], benign_label: int,
+) -> Tuple[np.ndarray, list[str], dict]:
+    """Drop BENIGN from the label space; remap remaining labels to 0..N-2.
+
+    Returns (y_remapped, attack_class_names, orig_to_new_map). orig_to_new_map
+    is a dict mapping original integer label -> new integer label. BENIGN is
+    deliberately omitted from the map.
+    """
+    attack_orig = [i for i in range(len(original_classes)) if i != benign_label]
+    orig_to_new = {orig: new for new, orig in enumerate(attack_orig)}
+    y_remap = np.array([orig_to_new[int(v)] for v in y_attack], dtype=np.int64)
+    attack_names = [original_classes[i] for i in attack_orig]
+    return y_remap, attack_names, orig_to_new

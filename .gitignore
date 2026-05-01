@@ -38,6 +38,7 @@ MachineLearningCVE/
 
 # MLflow tracking store and artifacts
 mlruns/
+mlflow.db
 
 # Misc
 cursor_explanations.txt

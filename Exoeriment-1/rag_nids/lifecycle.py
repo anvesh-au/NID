@@ -22,9 +22,12 @@ from .classifier import CrossAttentionHead
 from .encoder import FlowEncoder
 from .index import FlowIndex, PINNED
 from .pipeline import RAGNIDS
+from .stage1_vae import FlowVAE
+from .two_stage import TwoStageNIDS
 
 EXPERIMENT_NAME = "rag_nids"
 REGISTERED_MODEL = "rag_nids_pipeline"
+REGISTERED_MODEL_TWOSTAGE = "rag_nids_two_stage"
 
 
 # ---------------------------------------------------------------- artifact IO
@@ -107,6 +110,110 @@ class RAGNIDSWrapper(mlflow.pyfunc.PythonModel):
             "neighbor_labels": self.label_encoder.inverse_transform(p.neighbor_labels).tolist(),
             "neighbor_sims": p.neighbor_sims.tolist(),
         } for p in preds])
+
+
+# ---------------------------------------------------------------- two-stage save/load
+def save_two_stage_pipeline(
+    artifact_dir: str | Path,
+    vae: FlowVAE, threshold: float,
+    encoder: FlowEncoder, head: CrossAttentionHead, index: FlowIndex,
+    label_encoder, scaler,
+    feature_names: list[str],
+    k: int, num_classes: int,
+    n_attack_classes: int, attack_class_names: list[str],
+    benign_label: int, new_to_orig: dict,
+    vae_latent_dim: int, vae_hidden: int, vae_beta: float,
+    stage2_reject_threshold: float = 0.0,
+) -> Path:
+    """Persist every component needed to rebuild the two-stage pipeline."""
+    d = Path(artifact_dir); d.mkdir(parents=True, exist_ok=True)
+    torch.save(vae.state_dict(), d / "vae.pt")
+    torch.save(encoder.state_dict(), d / "encoder.pt")
+    torch.save(head.state_dict(), d / "head.pt")
+    _save_index(index, d)
+    with open(d / "label_encoder.pkl", "wb") as f:
+        pickle.dump(label_encoder, f)
+    with open(d / "scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+    (d / "config.json").write_text(json.dumps({
+        "two_stage": True,
+        "input_dim": len(feature_names),
+        "embed_dim": encoder.embed_dim,
+        "num_classes": num_classes,
+        "n_attack_classes": n_attack_classes,
+        "attack_class_names": attack_class_names,
+        "benign_label": int(benign_label),
+        "new_to_orig": {str(k): int(v) for k, v in new_to_orig.items()},
+        "k": k,
+        "feature_names": feature_names,
+        "vae_latent_dim": vae_latent_dim,
+        "vae_hidden": vae_hidden,
+        "vae_beta": vae_beta,
+        "stage1_threshold": float(threshold),
+        "stage2_reject_threshold": float(stage2_reject_threshold),
+    }))
+    return d
+
+
+class TwoStageWrapper(mlflow.pyfunc.PythonModel):
+    """Pyfunc wrapper for the two-stage pipeline."""
+
+    def load_context(self, context):
+        root = Path(context.artifacts["pipeline"])
+        cfg = json.loads((root / "config.json").read_text())
+        self.cfg = cfg
+
+        vae = FlowVAE(input_dim=cfg["input_dim"],
+                      latent_dim=cfg["vae_latent_dim"],
+                      hidden=cfg["vae_hidden"])
+        vae.load_state_dict(torch.load(root / "vae.pt", map_location="cpu"))
+
+        encoder = FlowEncoder(input_dim=cfg["input_dim"], embed_dim=cfg["embed_dim"])
+        encoder.load_state_dict(torch.load(root / "encoder.pt", map_location="cpu"))
+        head = CrossAttentionHead(cfg["embed_dim"], cfg["n_attack_classes"])
+        head.load_state_dict(torch.load(root / "head.pt", map_location="cpu"))
+        index = _load_index(root, cfg["embed_dim"])
+        stage2 = RAGNIDS(encoder, head, index, k=cfg["k"]).eval()
+
+        new_to_orig = {int(k): int(v) for k, v in cfg["new_to_orig"].items()}
+        self.model = TwoStageNIDS(
+            vae=vae, threshold=cfg["stage1_threshold"], stage2=stage2,
+            benign_label=cfg["benign_label"], new_to_orig=new_to_orig,
+            beta=cfg["vae_beta"],
+            stage2_reject_threshold=cfg.get("stage2_reject_threshold", 0.0),
+        ).eval()
+
+        with open(root / "scaler.pkl", "rb") as f:
+            self.scaler = pickle.load(f)
+        with open(root / "label_encoder.pkl", "rb") as f:
+            self.label_encoder = pickle.load(f)
+
+    def predict(self, context, model_input: Any) -> pd.DataFrame:
+        if isinstance(model_input, pd.DataFrame):
+            X = model_input[self.cfg["feature_names"]].values.astype(np.float32)
+        else:
+            X = np.asarray(model_input, dtype=np.float32)
+        X = self.scaler.transform(X).astype(np.float32)
+        out = self.model.predict_array(X)
+        labels = self.label_encoder.inverse_transform(out["preds"])
+        return pd.DataFrame({
+            "label": labels,
+            "stage1_score": out["stage1_scores"],
+            "stage1_attack": out["stage1_attack"],
+        })
+
+
+def log_and_register_two_stage(
+    artifact_dir: Path, e2e_macro_f1: float, register: bool = True,
+) -> Optional[str]:
+    model_info = mlflow.pyfunc.log_model(
+        artifact_path="model",
+        python_model=TwoStageWrapper(),
+        artifacts={"pipeline": str(artifact_dir)},
+        registered_model_name=REGISTERED_MODEL_TWOSTAGE if register else None,
+    )
+    mlflow.log_metric("test_macro_f1", e2e_macro_f1)
+    return model_info.model_uri
 
 
 # ---------------------------------------------------------------- MLflow glue
