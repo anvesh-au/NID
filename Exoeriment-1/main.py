@@ -154,6 +154,7 @@ def main():
                 loss_name=args.loss_name,
                 focal_gamma=args.focal_gamma,
                 replay_per_class=args.replay_per_class,
+                faiss_device=args.faiss_device,
                 enc_patience=args.enc_patience,
                 head_patience=args.head_patience,
                 seed=args.seed,

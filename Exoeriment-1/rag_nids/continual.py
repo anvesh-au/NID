@@ -276,6 +276,7 @@ def _train_session_model(
     loss_name: str,
     focal_gamma: float,
     ce_class_weights: Optional[torch.Tensor],
+    faiss_device: str,
     enc_patience: Optional[int],
     head_patience: Optional[int],
     seed: int,
@@ -304,7 +305,7 @@ def _train_session_model(
 
     index = build_index(
         trained_encoder, train_X, train_y,
-        use_hnsw=False, device=device, faiss_device="cpu",
+        use_hnsw=False, device=device, faiss_device=faiss_device,
     )
 
     init_head = _expand_head(head, num_classes) if head is not None else None
@@ -336,6 +337,7 @@ def run_continual_sessions(
     loss_name: str = "ce",
     focal_gamma: float = 2.0,
     replay_per_class: int = 50,
+    faiss_device: str = "cpu",
     enc_patience: Optional[int] = None,
     head_patience: Optional[int] = None,
     seed: int = 0,
@@ -377,14 +379,15 @@ def run_continual_sessions(
 
         num_classes = label_space.num_classes
         ce_w = ce_class_weights(train_y, num_classes=num_classes)
-        print(f"[session] {session.name}: train={len(train_X)} test={len(X_te)} classes={num_classes}")
+        print(f"[session] {session.name}: train={len(train_X)} test={len(X_te)} "
+              f"classes={num_classes} faiss_device={faiss_device}")
 
         encoder, head, index, model = _train_session_model(
             encoder, head, train_X, train_y, num_classes=num_classes, embed_dim=embed_dim,
             k=k, device=device, enc_epochs=enc_epochs, head_epochs=head_epochs,
             enc_lr=enc_lr, head_lr=head_lr, n_heads=n_heads, supcon_weight=supcon_weight,
             ce_weight=ce_weight, temperature=temperature, loss_name=loss_name,
-            focal_gamma=focal_gamma, ce_class_weights=ce_w,
+            focal_gamma=focal_gamma, ce_class_weights=ce_w, faiss_device=faiss_device,
             enc_patience=enc_patience, head_patience=head_patience, seed=seed + session_idx,
         )
 
