@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 
 try:  # pragma: no cover - optional runtime dependency in some environments
@@ -59,6 +59,7 @@ class SessionResult:
     test_rows: int
     num_classes: int
     per_class: pd.DataFrame
+    confusion_rates: pd.DataFrame
     label_names: list[str]
 
 
@@ -239,6 +240,16 @@ def _evaluate_session(
     prec, rec, f1, support = precision_recall_fscore_support(
         y, y_pred, labels=np.arange(len(label_names)), zero_division=0
     )
+    present_mask = support > 0
+    if np.any(present_mask):
+        precision_macro = float(np.mean(prec[present_mask]))
+        recall_macro = float(np.mean(rec[present_mask]))
+        f1_macro = float(np.mean(f1[present_mask]))
+    else:
+        precision_macro = 0.0
+        recall_macro = 0.0
+        f1_macro = 0.0
+
     per_class = pd.DataFrame({
         "label": label_names,
         "precision": prec,
@@ -246,12 +257,28 @@ def _evaluate_session(
         "f1": f1,
         "support": support,
     })
+    cm_counts = confusion_matrix(
+        y, y_pred, labels=np.arange(len(label_names))
+    )
+    row_sums = cm_counts.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cm_rates = np.divide(
+            cm_counts.astype(np.float64),
+            row_sums,
+            out=np.zeros_like(cm_counts, dtype=np.float64),
+            where=row_sums != 0,
+        )
+    confusion_rates = pd.DataFrame(cm_rates, index=label_names, columns=label_names)
+    confusion_rates.index.name = "true"
+    confusion_rates.columns.name = "pred"
+
     metrics = {
         "accuracy": float(acc),
-        "precision_macro": float(np.mean(prec)),
-        "recall_macro": float(np.mean(rec)),
-        "f1_macro": float(np.mean(f1)),
+        "precision_macro": precision_macro,
+        "recall_macro": recall_macro,
+        "f1_macro": f1_macro,
         "preds": y_pred,
+        "confusion_rates": confusion_rates,
     }
     return metrics, per_class
 
@@ -402,6 +429,7 @@ def run_continual_sessions(
             test_rows=len(X_te),
             num_classes=num_classes,
             per_class=per_class,
+            confusion_rates=metrics["confusion_rates"],
             label_names=label_space.id_to_label.copy(),
         )
         results.append(result)
@@ -412,6 +440,8 @@ def run_continual_sessions(
             f"recall_macro={result.recall_macro:.4f} f1_macro={result.f1_macro:.4f}"
         )
         print(per_class.to_string(index=False))
+        print("[confusion matrix] row-normalized rates (per-class recall):")
+        print(result.confusion_rates.round(4).to_string())
 
         if _HAS_MLFLOW and mlflow.active_run() is not None:  # pragma: no cover
             mlflow.log_metrics({
@@ -425,6 +455,7 @@ def run_continual_sessions(
             session_dir = out_root / session.name
             session_dir.mkdir(parents=True, exist_ok=True)
             per_class.to_csv(session_dir / "per_class_metrics.csv", index=False)
+            result.confusion_rates.to_csv(session_dir / "confusion_matrix_rates.csv")
             pd.DataFrame([{
                 "session": session.name,
                 "train_rows": result.train_rows,
