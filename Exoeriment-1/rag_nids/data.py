@@ -110,3 +110,11 @@ def class_weights(y: np.ndarray) -> torch.Tensor:
     counts = np.bincount(y)
     w = 1.0 / np.maximum(counts, 1)
     return torch.from_numpy(w[y].astype(np.float32))
+
+
+def ce_class_weights(y: np.ndarray, num_classes: int | None = None) -> torch.Tensor:
+    """Inverse-frequency class weights for cross-entropy losses."""
+    counts = np.bincount(y, minlength=num_classes) if num_classes is not None else np.bincount(y)
+    weights = counts.sum() / np.maximum(counts, 1)
+    weights = weights / max(len(weights), 1)
+    return torch.from_numpy(weights.astype(np.float32))

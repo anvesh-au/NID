@@ -12,15 +12,20 @@ import tempfile
 from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
 
-import mlflow
 import numpy as np
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
+try:
+    import mlflow
+    _HAS_MLFLOW = True
+except ImportError:  # pragma: no cover
+    mlflow = None
+    _HAS_MLFLOW = False
 
 from rag_nids import RAGNIDS
 from rag_nids.continual import run_continual_sessions
-from rag_nids.data import class_weights, load_cic_ids2017
+from rag_nids.data import ce_class_weights, load_cic_ids2017
 from rag_nids.encoder import FlowEncoder
 from rag_nids.infer import evaluate, explain
 from rag_nids.lifecycle import (
@@ -116,7 +121,9 @@ def main():
     if args.data_dir is None and args.session_manifest is None:
         ap.error("either --data_dir or --session_manifest must be provided")
     subsample = None if args.subsample <= 0 else args.subsample
-    use_mlflow = not args.no_mlflow
+    use_mlflow = (not args.no_mlflow) and _HAS_MLFLOW
+    if not args.no_mlflow and not _HAS_MLFLOW:
+        print("[warning] mlflow is not installed; proceeding with --no_mlflow behavior.")
 
     set_seed(args.seed)
     log_device_status(args.device)
@@ -177,9 +184,7 @@ def main():
         cw = None
         if args.class_weighted_ce:
             # print("[train] class-weighted CE")
-            counts = np.bincount(y_tr, minlength=num_classes).astype(np.float32)
-            w = counts.sum() / (num_classes * np.maximum(counts, 1))
-            cw = torch.from_numpy(w)
+            cw = ce_class_weights(y_tr, num_classes=num_classes)
 
         init_encoder = None
         if args.scarf_epochs > 0:

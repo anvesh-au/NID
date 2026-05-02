@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover
     _HAS_MLFLOW = False
 
 from .classifier import CrossAttentionHead
-from .data import class_weights, load_cic_ids2017_frame
+from .data import ce_class_weights, load_cic_ids2017_frame
 from .encoder import FlowEncoder
 from .index import FlowIndex
 from .pipeline import RAGNIDS
@@ -376,7 +376,7 @@ def run_continual_sessions(
             train_X, train_y = X_tr, y_tr
 
         num_classes = label_space.num_classes
-        ce_w = class_weights(train_y)
+        ce_w = ce_class_weights(train_y, num_classes=num_classes)
         print(f"[session] {session.name}: train={len(train_X)} test={len(X_te)} classes={num_classes}")
 
         encoder, head, index, model = _train_session_model(
