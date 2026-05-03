@@ -11,7 +11,9 @@ import sys
 import tempfile
 from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
+import pandas as pd
 import numpy as np
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
@@ -24,6 +26,7 @@ except ImportError:  # pragma: no cover
     _HAS_MLFLOW = False
 
 from rag_nids import RAGNIDS
+from rag_nids.ablation import run_continual_ablation, run_full_ablation
 from rag_nids.continual import run_continual_sessions
 from rag_nids.data import ce_class_weights, load_cic_ids2017
 from rag_nids.encoder import FlowEncoder
@@ -104,6 +107,12 @@ def main():
                     help="JSON manifest describing continual-learning sessions")
     ap.add_argument("--session_output_dir", default=None,
                     help="Optional directory for per-session CSV artifacts")
+    ap.add_argument("--ablation_mode", choices=["none", "continual", "full"], default="none",
+                    help="Run ablation experiments instead of the default training pipelines")
+    ap.add_argument("--ablation_output_dir", default="outputs/ablation",
+                    help="Directory for ablation summaries")
+    ap.add_argument("--ablation_seeds", type=int, default=1,
+                    help="Number of sequential seeds to run for ablation (seed, seed+1, ...)")
     ap.add_argument("--replay_per_class", type=int, default=50,
                     help="Replay exemplars retained per class across sessions")
     ap.add_argument("--recency_alpha", type=float, default=0.0,
@@ -141,6 +150,47 @@ def main():
             mlflow.log_params({f"pkg.{k}": v for k, v in _pkg_versions().items()})
 
         if args.session_manifest is not None:
+            if args.ablation_mode == "continual":
+                dfs = []
+                for s in range(args.seed, args.seed + max(args.ablation_seeds, 1)):
+                    df_seed = run_continual_ablation(
+                        manifest_path=args.session_manifest,
+                        output_dir=f"{args.ablation_output_dir}/seed_{s}",
+                        device=args.device,
+                        faiss_device=args.faiss_device,
+                        test_size=args.test_size,
+                        embed_dim=args.embed_dim,
+                        k=args.k,
+                        enc_epochs=args.enc_epochs,
+                        head_epochs=args.head_epochs,
+                        enc_lr=args.enc_lr,
+                        head_lr=args.head_lr,
+                        supcon_weight=args.supcon_weight,
+                        ce_weight=args.ce_weight,
+                        temperature=args.temperature,
+                        n_heads=args.n_heads,
+                        loss_name=args.loss_name,
+                        focal_gamma=args.focal_gamma,
+                        replay_per_class=args.replay_per_class,
+                        seed=s,
+                        recency_alpha=args.recency_alpha,
+                        encoder_first_session_only=args.encoder_first_session_only,
+                    )
+                    dfs.append(df_seed)
+                df = pd.concat(dfs, ignore_index=True)
+                agg = df.groupby(["mode", "model", "session"], as_index=False).agg(
+                    accuracy_mean=("accuracy", "mean"), accuracy_std=("accuracy", "std"),
+                    precision_macro_mean=("precision_macro", "mean"), precision_macro_std=("precision_macro", "std"),
+                    recall_macro_mean=("recall_macro", "mean"), recall_macro_std=("recall_macro", "std"),
+                    f1_macro_mean=("f1_macro", "mean"), f1_macro_std=("f1_macro", "std"),
+                    f1_weighted_mean=("f1_weighted", "mean"), f1_weighted_std=("f1_weighted", "std"),
+                )
+                out_root = Path(args.ablation_output_dir)
+                out_root.mkdir(parents=True, exist_ok=True)
+                df.to_csv(out_root / "ablation_continual_all_seeds.csv", index=False)
+                agg.to_csv(out_root / "ablation_continual_aggregate.csv", index=False)
+                print(agg.to_string(index=False))
+                return
             results = run_continual_sessions(
                 args.session_manifest,
                 device=args.device,
@@ -170,6 +220,47 @@ def main():
             for r in results:
                 print(f"  {r.name}: acc={r.accuracy:.4f} prec={r.precision_macro:.4f} "
                       f"rec={r.recall_macro:.4f} f1={r.f1_macro:.4f}")
+            return
+
+        if args.ablation_mode == "full":
+            dfs = []
+            for s in range(args.seed, args.seed + max(args.ablation_seeds, 1)):
+                df_seed = run_full_ablation(
+                    data_dir=args.data_dir,
+                    output_dir=f"{args.ablation_output_dir}/seed_{s}",
+                    seed=s,
+                    test_size=args.test_size,
+                    subsample=subsample,
+                    device=args.device,
+                    faiss_device=args.faiss_device,
+                    embed_dim=args.embed_dim,
+                    k=args.k,
+                    enc_epochs=args.enc_epochs,
+                    head_epochs=args.head_epochs,
+                    enc_lr=args.enc_lr,
+                    head_lr=args.head_lr,
+                    supcon_weight=args.supcon_weight,
+                    ce_weight=args.ce_weight,
+                    temperature=args.temperature,
+                    n_heads=args.n_heads,
+                    loss_name=args.loss_name,
+                    focal_gamma=args.focal_gamma,
+                    recency_alpha=args.recency_alpha,
+                )
+                dfs.append(df_seed)
+            df = pd.concat(dfs, ignore_index=True)
+            agg = df.groupby(["mode", "model", "session"], as_index=False).agg(
+                accuracy_mean=("accuracy", "mean"), accuracy_std=("accuracy", "std"),
+                precision_macro_mean=("precision_macro", "mean"), precision_macro_std=("precision_macro", "std"),
+                recall_macro_mean=("recall_macro", "mean"), recall_macro_std=("recall_macro", "std"),
+                f1_macro_mean=("f1_macro", "mean"), f1_macro_std=("f1_macro", "std"),
+                f1_weighted_mean=("f1_weighted", "mean"), f1_weighted_std=("f1_weighted", "std"),
+            )
+            out_root = Path(args.ablation_output_dir)
+            out_root.mkdir(parents=True, exist_ok=True)
+            df.to_csv(out_root / "ablation_full_all_seeds.csv", index=False)
+            agg.to_csv(out_root / "ablation_full_aggregate.csv", index=False)
+            print(agg.to_string(index=False))
             return
 
         print(f"[data] loading {args.data_dir}")
@@ -241,7 +332,6 @@ def main():
 
         print("[eval] test set")
         with tempfile.TemporaryDirectory() as tmp:
-            import pandas as pd
             res = evaluate(model, X_te, y_te, label_names, device=args.device,
                            cm_out_dir=tmp)  # writes confusion_matrix_{counts,rates}.csv
             preds, trues = res["preds"], res["trues"]
