@@ -11,15 +11,24 @@ import sys
 import tempfile
 from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
-import mlflow
+import pandas as pd
 import numpy as np
 import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
+try:
+    import mlflow
+    _HAS_MLFLOW = True
+except ImportError:  # pragma: no cover
+    mlflow = None
+    _HAS_MLFLOW = False
 
 from rag_nids import RAGNIDS
-from rag_nids.data import class_weights, load_cic_ids2017
+from rag_nids.ablation import run_continual_ablation, run_continual_full_ablation, run_full_ablation
+from rag_nids.continual import run_continual_sessions
+from rag_nids.data import ce_class_weights, load_cic_ids2017
 from rag_nids.encoder import FlowEncoder
 from rag_nids.infer import evaluate, explain
 from rag_nids.lifecycle import (
@@ -61,7 +70,8 @@ def _pkg_versions() -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", required=True)
+    ap.add_argument("--data_dir", default=None,
+                    help="Directory containing CIC-IDS2017 CSVs for the single-session pipeline")
     ap.add_argument("--subsample", type=int, default=50_000,
                     help="Max rows to keep per run; use 0 for the full dataset")
     ap.add_argument("--test_size", type=float, default=0.2,
@@ -93,6 +103,28 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--run_name", default="poc")
     ap.add_argument("--promote_threshold", type=float, default=0.80)
+    ap.add_argument("--session_manifest", default=None,
+                    help="JSON manifest describing continual-learning sessions")
+    ap.add_argument("--session_output_dir", default=None,
+                    help="Optional directory for per-session CSV artifacts")
+    ap.add_argument("--ablation_mode", choices=["none", "continual", "continual_full", "full"], default="none",
+                    help="Run ablation experiments instead of the default training pipelines")
+    ap.add_argument("--ablation_output_dir", default="outputs/ablation",
+                    help="Directory for ablation summaries")
+    ap.add_argument("--ablation_seeds", type=int, default=1,
+                    help="Number of sequential seeds to run for ablation (seed, seed+1, ...)")
+    ap.add_argument("--full_split_mode", choices=["random", "temporal"], default="random",
+                    help="Full ablation split strategy: stratified random or temporal session holdout")
+    ap.add_argument("--temporal_manifest", default=None,
+                    help="Session manifest used for temporal full-ablation split")
+    ap.add_argument("--temporal_test_session_idx", type=int, default=-1,
+                    help="Temporal split test-session index; -1 means last session")
+    ap.add_argument("--replay_per_class", type=int, default=50,
+                    help="Replay exemplars retained per class across sessions")
+    ap.add_argument("--recency_alpha", type=float, default=0.0,
+                    help="Recency bias for retrieval reranking: score = sim + alpha * normalized_recency")
+    ap.add_argument("--encoder_first_session_only", action="store_true",
+                    help="In continual mode, train encoder only in the first session and keep it frozen afterwards")
     ap.add_argument("--no_mlflow", action="store_true",
                     help="Disable MLflow tracking, artifact logging, and registry updates")
     def _default_device() -> str:
@@ -105,8 +137,12 @@ def main():
     ap.add_argument("--faiss_device", choices=["cpu", "cuda"], default="cpu",
                     help="FAISS index device. 'cuda' requires a GPU-enabled faiss build.")
     args = ap.parse_args()
+    if args.data_dir is None and args.session_manifest is None:
+        ap.error("either --data_dir or --session_manifest must be provided")
     subsample = None if args.subsample <= 0 else args.subsample
-    use_mlflow = not args.no_mlflow
+    use_mlflow = (not args.no_mlflow) and _HAS_MLFLOW
+    if not args.no_mlflow and not _HAS_MLFLOW:
+        print("[warning] mlflow is not installed; proceeding with --no_mlflow behavior.")
 
     set_seed(args.seed)
     log_device_status(args.device)
@@ -118,6 +154,164 @@ def main():
         if use_mlflow:
             mlflow.log_params(vars(args))
             mlflow.log_params({f"pkg.{k}": v for k, v in _pkg_versions().items()})
+
+        if args.session_manifest is not None:
+            if args.ablation_mode == "continual_full":
+                dfs = []
+                for s in range(args.seed, args.seed + max(args.ablation_seeds, 1)):
+                    df_seed = run_continual_full_ablation(
+                        manifest_path=args.session_manifest,
+                        output_dir=f"{args.ablation_output_dir}/seed_{s}",
+                        device=args.device,
+                        faiss_device=args.faiss_device,
+                        test_size=args.test_size,
+                        embed_dim=args.embed_dim,
+                        k=args.k,
+                        enc_epochs=args.enc_epochs,
+                        head_epochs=args.head_epochs,
+                        enc_lr=args.enc_lr,
+                        head_lr=args.head_lr,
+                        supcon_weight=args.supcon_weight,
+                        ce_weight=args.ce_weight,
+                        temperature=args.temperature,
+                        n_heads=args.n_heads,
+                        loss_name=args.loss_name,
+                        focal_gamma=args.focal_gamma,
+                        replay_per_class=args.replay_per_class,
+                        seed=s,
+                        recency_alpha=args.recency_alpha,
+                        encoder_first_session_only=args.encoder_first_session_only,
+                    )
+                    dfs.append(df_seed)
+                df = pd.concat(dfs, ignore_index=True)
+                agg = df.groupby(["mode", "model", "session"], as_index=False).agg(
+                    accuracy_mean=("accuracy", "mean"), accuracy_std=("accuracy", "std"),
+                    precision_macro_mean=("precision_macro", "mean"), precision_macro_std=("precision_macro", "std"),
+                    recall_macro_mean=("recall_macro", "mean"), recall_macro_std=("recall_macro", "std"),
+                    f1_macro_mean=("f1_macro", "mean"), f1_macro_std=("f1_macro", "std"),
+                    f1_weighted_mean=("f1_weighted", "mean"), f1_weighted_std=("f1_weighted", "std"),
+                )
+                out_root = Path(args.ablation_output_dir)
+                out_root.mkdir(parents=True, exist_ok=True)
+                df.to_csv(out_root / "ablation_continual_full_all_seeds.csv", index=False)
+                agg.to_csv(out_root / "ablation_continual_full_aggregate.csv", index=False)
+                print(agg.to_string(index=False))
+                return
+            if args.ablation_mode == "continual":
+                dfs = []
+                for s in range(args.seed, args.seed + max(args.ablation_seeds, 1)):
+                    df_seed = run_continual_ablation(
+                        manifest_path=args.session_manifest,
+                        output_dir=f"{args.ablation_output_dir}/seed_{s}",
+                        device=args.device,
+                        faiss_device=args.faiss_device,
+                        test_size=args.test_size,
+                        embed_dim=args.embed_dim,
+                        k=args.k,
+                        enc_epochs=args.enc_epochs,
+                        head_epochs=args.head_epochs,
+                        enc_lr=args.enc_lr,
+                        head_lr=args.head_lr,
+                        supcon_weight=args.supcon_weight,
+                        ce_weight=args.ce_weight,
+                        temperature=args.temperature,
+                        n_heads=args.n_heads,
+                        loss_name=args.loss_name,
+                        focal_gamma=args.focal_gamma,
+                        replay_per_class=args.replay_per_class,
+                        seed=s,
+                        recency_alpha=args.recency_alpha,
+                        encoder_first_session_only=args.encoder_first_session_only,
+                    )
+                    dfs.append(df_seed)
+                df = pd.concat(dfs, ignore_index=True)
+                agg = df.groupby(["mode", "model", "session"], as_index=False).agg(
+                    accuracy_mean=("accuracy", "mean"), accuracy_std=("accuracy", "std"),
+                    precision_macro_mean=("precision_macro", "mean"), precision_macro_std=("precision_macro", "std"),
+                    recall_macro_mean=("recall_macro", "mean"), recall_macro_std=("recall_macro", "std"),
+                    f1_macro_mean=("f1_macro", "mean"), f1_macro_std=("f1_macro", "std"),
+                    f1_weighted_mean=("f1_weighted", "mean"), f1_weighted_std=("f1_weighted", "std"),
+                )
+                out_root = Path(args.ablation_output_dir)
+                out_root.mkdir(parents=True, exist_ok=True)
+                df.to_csv(out_root / "ablation_continual_all_seeds.csv", index=False)
+                agg.to_csv(out_root / "ablation_continual_aggregate.csv", index=False)
+                print(agg.to_string(index=False))
+                return
+            results = run_continual_sessions(
+                args.session_manifest,
+                device=args.device,
+                test_size=args.test_size,
+                embed_dim=args.embed_dim,
+                k=args.k,
+                enc_epochs=args.enc_epochs,
+                head_epochs=args.head_epochs,
+                enc_lr=args.enc_lr,
+                head_lr=args.head_lr,
+                supcon_weight=args.supcon_weight,
+                ce_weight=args.ce_weight,
+                temperature=args.temperature,
+                n_heads=args.n_heads,
+                loss_name=args.loss_name,
+                focal_gamma=args.focal_gamma,
+                recency_alpha=args.recency_alpha,
+                replay_per_class=args.replay_per_class,
+                faiss_device=args.faiss_device,
+                encoder_first_session_only=args.encoder_first_session_only,
+                enc_patience=args.enc_patience,
+                head_patience=args.head_patience,
+                seed=args.seed,
+                output_dir=args.session_output_dir,
+            )
+            print("[session] summary")
+            for r in results:
+                print(f"  {r.name}: acc={r.accuracy:.4f} prec={r.precision_macro:.4f} "
+                      f"rec={r.recall_macro:.4f} f1={r.f1_macro:.4f}")
+            return
+
+        if args.ablation_mode == "full":
+            dfs = []
+            for s in range(args.seed, args.seed + max(args.ablation_seeds, 1)):
+                df_seed = run_full_ablation(
+                    data_dir=args.data_dir,
+                    output_dir=f"{args.ablation_output_dir}/seed_{s}",
+                    seed=s,
+                    test_size=args.test_size,
+                    subsample=subsample,
+                    device=args.device,
+                    faiss_device=args.faiss_device,
+                    embed_dim=args.embed_dim,
+                    k=args.k,
+                    enc_epochs=args.enc_epochs,
+                    head_epochs=args.head_epochs,
+                    enc_lr=args.enc_lr,
+                    head_lr=args.head_lr,
+                    supcon_weight=args.supcon_weight,
+                    ce_weight=args.ce_weight,
+                    temperature=args.temperature,
+                    n_heads=args.n_heads,
+                    loss_name=args.loss_name,
+                    focal_gamma=args.focal_gamma,
+                    recency_alpha=args.recency_alpha,
+                    split_mode=args.full_split_mode,
+                    temporal_manifest_path=args.temporal_manifest,
+                    temporal_test_session_idx=args.temporal_test_session_idx,
+                )
+                dfs.append(df_seed)
+            df = pd.concat(dfs, ignore_index=True)
+            agg = df.groupby(["mode", "model", "session"], as_index=False).agg(
+                accuracy_mean=("accuracy", "mean"), accuracy_std=("accuracy", "std"),
+                precision_macro_mean=("precision_macro", "mean"), precision_macro_std=("precision_macro", "std"),
+                recall_macro_mean=("recall_macro", "mean"), recall_macro_std=("recall_macro", "std"),
+                f1_macro_mean=("f1_macro", "mean"), f1_macro_std=("f1_macro", "std"),
+                f1_weighted_mean=("f1_weighted", "mean"), f1_weighted_std=("f1_weighted", "std"),
+            )
+            out_root = Path(args.ablation_output_dir)
+            out_root.mkdir(parents=True, exist_ok=True)
+            df.to_csv(out_root / "ablation_full_all_seeds.csv", index=False)
+            agg.to_csv(out_root / "ablation_full_aggregate.csv", index=False)
+            print(agg.to_string(index=False))
+            return
 
         print(f"[data] loading {args.data_dir}")
         X, y, feats, scaler, label_enc = load_cic_ids2017(args.data_dir, subsample=subsample,
@@ -138,9 +332,7 @@ def main():
         cw = None
         if args.class_weighted_ce:
             # print("[train] class-weighted CE")
-            counts = np.bincount(y_tr, minlength=num_classes).astype(np.float32)
-            w = counts.sum() / (num_classes * np.maximum(counts, 1))
-            cw = torch.from_numpy(w)
+            cw = ce_class_weights(y_tr, num_classes=num_classes)
 
         init_encoder = None
         if args.scarf_epochs > 0:
@@ -181,14 +373,15 @@ def main():
             k=args.k, n_heads=args.n_heads, epochs=args.head_epochs, lr=args.head_lr,
             device=args.device, val=(X_te, y_te),
             ce_class_weights=cw, loss_name=args.loss_name, focal_gamma=args.focal_gamma,
-            patience=args.head_patience,
+            patience=args.head_patience, recency_alpha=args.recency_alpha,
         )
 
-        model = RAGNIDS(encoder, head, index, k=args.k).to(args.device)
+        model = RAGNIDS(
+            encoder, head, index, k=args.k, recency_alpha=args.recency_alpha
+        ).to(args.device)
 
         print("[eval] test set")
         with tempfile.TemporaryDirectory() as tmp:
-            import pandas as pd
             res = evaluate(model, X_te, y_te, label_names, device=args.device,
                            cm_out_dir=tmp)  # writes confusion_matrix_{counts,rates}.csv
             preds, trues = res["preds"], res["trues"]

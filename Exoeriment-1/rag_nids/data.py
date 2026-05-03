@@ -23,13 +23,13 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=drop, errors="ignore")
 
 
-def load_cic_ids2017(
+def _load_cic_ids2017_frame(
     csv_dir: str | Path,
     label_col: str = "Label",
     subsample: int | None = None,
     seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, list[str], StandardScaler, LabelEncoder]:
-    """Load all CIC-IDS2017 CSVs in `csv_dir`, return (X, y, feature_names, scaler, label_enc)."""
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Load and clean CIC-IDS2017 into a numeric feature frame plus raw labels."""
     csv_dir = Path(csv_dir)
     files = sorted(csv_dir.glob("*.csv"))
     if not files:
@@ -52,14 +52,37 @@ def load_cic_ids2017(
             )
         )
 
-    y_raw = df[label_col].values
+    y_raw = df[label_col].astype(str).values
     X_df = df.drop(columns=[label_col])
     # Protocol one-hot if present as small-cardinality int
     if "Protocol" in X_df.columns and X_df["Protocol"].nunique() < 20:
         X_df = pd.get_dummies(X_df, columns=["Protocol"], prefix="proto")
 
     X_df = X_df.select_dtypes(include=[np.number]).astype(np.float32)
-    feature_names = list(X_df.columns)
+    return X_df, y_raw
+
+
+def load_cic_ids2017_frame(
+    csv_dir: str | Path,
+    label_col: str = "Label",
+    subsample: int | None = None,
+    seed: int = 0,
+) -> Tuple[pd.DataFrame, np.ndarray, list[str]]:
+    """Return the cleaned numeric feature frame, raw labels, and feature names."""
+    X_df, y_raw = _load_cic_ids2017_frame(csv_dir, label_col=label_col, subsample=subsample, seed=seed)
+    return X_df, y_raw, list(X_df.columns)
+
+
+def load_cic_ids2017(
+    csv_dir: str | Path,
+    label_col: str = "Label",
+    subsample: int | None = None,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, list[str], StandardScaler, LabelEncoder]:
+    """Load all CIC-IDS2017 CSVs in `csv_dir`, return (X, y, feature_names, scaler, label_enc)."""
+    X_df, y_raw, feature_names = load_cic_ids2017_frame(
+        csv_dir, label_col=label_col, subsample=subsample, seed=seed
+    )
 
     scaler = StandardScaler().fit(X_df.values)
     X = scaler.transform(X_df.values).astype(np.float32)
@@ -87,3 +110,11 @@ def class_weights(y: np.ndarray) -> torch.Tensor:
     counts = np.bincount(y)
     w = 1.0 / np.maximum(counts, 1)
     return torch.from_numpy(w[y].astype(np.float32))
+
+
+def ce_class_weights(y: np.ndarray, num_classes: int | None = None) -> torch.Tensor:
+    """Inverse-frequency class weights for cross-entropy losses."""
+    counts = np.bincount(y, minlength=num_classes) if num_classes is not None else np.bincount(y)
+    weights = counts.sum() / np.maximum(counts, 1)
+    weights = weights / max(len(weights), 1)
+    return torch.from_numpy(weights.astype(np.float32))

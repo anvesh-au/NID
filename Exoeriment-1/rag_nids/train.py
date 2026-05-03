@@ -111,6 +111,7 @@ def train_encoder(
     temperature: float = 0.1, device: str = "cpu",
     ce_class_weights: Optional[torch.Tensor] = None,
     init_encoder: Optional[FlowEncoder] = None,
+    init_aux_head: Optional[nn.Linear] = None,
     patience: Optional[int] = None, min_delta: float = 1e-4,
     val_frac: float = 0.1, seed: int = 0,
 ) -> FlowEncoder:
@@ -118,6 +119,8 @@ def train_encoder(
     encoder = init_encoder if init_encoder is not None else FlowEncoder(input_dim=X.shape[1], embed_dim=embed_dim)
     encoder = encoder.to(device)
     model = EncoderWithAuxHead(encoder, num_classes).to(device)
+    if init_aux_head is not None:
+        model.aux.load_state_dict(init_aux_head.state_dict())
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     supcon = losses.SupConLoss(temperature=temperature)
@@ -268,9 +271,12 @@ def train_head(
     loss_name: str = "ce",   # "ce" | "focal"
     focal_gamma: float = 2.0,
     patience: Optional[int] = None, min_delta: float = 1e-4,
+    init_head: Optional[CrossAttentionHead] = None,
+    recency_alpha: float = 0.0,
 ) -> CrossAttentionHead:
-    head = CrossAttentionHead(encoder.embed_dim, num_classes, n_heads=n_heads).to(device)
-    model = RAGNIDS(encoder, head, index, k=k).to(device)
+    head = init_head if init_head is not None else CrossAttentionHead(encoder.embed_dim, num_classes, n_heads=n_heads)
+    head = head.to(device)
+    model = RAGNIDS(encoder, head, index, k=k, recency_alpha=recency_alpha).to(device)
 
     # Freeze encoder during head training — simpler, avoids destabilizing the index geometry mid-training.
     for p in encoder.parameters():
