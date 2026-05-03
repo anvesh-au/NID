@@ -106,6 +106,8 @@ def main():
                     help="Optional directory for per-session CSV artifacts")
     ap.add_argument("--replay_per_class", type=int, default=50,
                     help="Replay exemplars retained per class across sessions")
+    ap.add_argument("--recency_alpha", type=float, default=0.0,
+                    help="Recency bias for retrieval reranking: score = sim + alpha * normalized_recency")
     ap.add_argument("--encoder_first_session_only", action="store_true",
                     help="In continual mode, train encoder only in the first session and keep it frozen afterwards")
     ap.add_argument("--no_mlflow", action="store_true",
@@ -155,6 +157,7 @@ def main():
                 n_heads=args.n_heads,
                 loss_name=args.loss_name,
                 focal_gamma=args.focal_gamma,
+                recency_alpha=args.recency_alpha,
                 replay_per_class=args.replay_per_class,
                 faiss_device=args.faiss_device,
                 encoder_first_session_only=args.encoder_first_session_only,
@@ -229,10 +232,12 @@ def main():
             k=args.k, n_heads=args.n_heads, epochs=args.head_epochs, lr=args.head_lr,
             device=args.device, val=(X_te, y_te),
             ce_class_weights=cw, loss_name=args.loss_name, focal_gamma=args.focal_gamma,
-            patience=args.head_patience,
+            patience=args.head_patience, recency_alpha=args.recency_alpha,
         )
 
-        model = RAGNIDS(encoder, head, index, k=args.k).to(args.device)
+        model = RAGNIDS(
+            encoder, head, index, k=args.k, recency_alpha=args.recency_alpha
+        ).to(args.device)
 
         print("[eval] test set")
         with tempfile.TemporaryDirectory() as tmp:

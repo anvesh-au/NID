@@ -307,6 +307,7 @@ def _train_session_model(
     temperature: float,
     loss_name: str,
     focal_gamma: float,
+    recency_alpha: float,
     ce_class_weights: Optional[torch.Tensor],
     faiss_device: str,
     train_encoder_this_session: bool,
@@ -361,9 +362,12 @@ def _train_session_model(
         k=k, n_heads=n_heads, epochs=head_epochs, lr=head_lr, device=device,
         val=None, ce_class_weights=ce_class_weights, loss_name=loss_name,
         focal_gamma=focal_gamma, patience=head_patience, init_head=init_head,
+        recency_alpha=recency_alpha,
     )
 
-    model = RAGNIDS(trained_encoder, trained_head, index, k=k).to(device)
+    model = RAGNIDS(
+        trained_encoder, trained_head, index, k=k, recency_alpha=recency_alpha
+    ).to(device)
     return trained_encoder, trained_head, index, model
 
 
@@ -383,6 +387,7 @@ def run_continual_sessions(
     n_heads: int = 4,
     loss_name: str = "ce",
     focal_gamma: float = 2.0,
+    recency_alpha: float = 0.0,
     replay_per_class: int = 50,
     faiss_device: str = "cpu",
     encoder_first_session_only: bool = False,
@@ -450,6 +455,7 @@ def run_continual_sessions(
             k=k, device=device, enc_epochs=enc_epochs, head_epochs=head_epochs,
             enc_lr=enc_lr, head_lr=head_lr, n_heads=n_heads, supcon_weight=supcon_weight,
             ce_weight=ce_weight, temperature=temperature, loss_name=loss_name,
+            recency_alpha=recency_alpha,
             focal_gamma=focal_gamma, ce_class_weights=ce_w, faiss_device=faiss_device,
             train_encoder_this_session=train_encoder_this_session,
             enc_patience=enc_patience, head_patience=head_patience, seed=seed + session_idx,

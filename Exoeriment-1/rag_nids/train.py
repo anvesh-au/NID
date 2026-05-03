@@ -272,10 +272,11 @@ def train_head(
     focal_gamma: float = 2.0,
     patience: Optional[int] = None, min_delta: float = 1e-4,
     init_head: Optional[CrossAttentionHead] = None,
+    recency_alpha: float = 0.0,
 ) -> CrossAttentionHead:
     head = init_head if init_head is not None else CrossAttentionHead(encoder.embed_dim, num_classes, n_heads=n_heads)
     head = head.to(device)
-    model = RAGNIDS(encoder, head, index, k=k).to(device)
+    model = RAGNIDS(encoder, head, index, k=k, recency_alpha=recency_alpha).to(device)
 
     # Freeze encoder during head training — simpler, avoids destabilizing the index geometry mid-training.
     for p in encoder.parameters():
