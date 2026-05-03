@@ -106,6 +106,8 @@ def main():
                     help="Optional directory for per-session CSV artifacts")
     ap.add_argument("--replay_per_class", type=int, default=50,
                     help="Replay exemplars retained per class across sessions")
+    ap.add_argument("--encoder_first_session_only", action="store_true",
+                    help="In continual mode, train encoder only in the first session and keep it frozen afterwards")
     ap.add_argument("--no_mlflow", action="store_true",
                     help="Disable MLflow tracking, artifact logging, and registry updates")
     def _default_device() -> str:
@@ -155,6 +157,7 @@ def main():
                 focal_gamma=args.focal_gamma,
                 replay_per_class=args.replay_per_class,
                 faiss_device=args.faiss_device,
+                encoder_first_session_only=args.encoder_first_session_only,
                 enc_patience=args.enc_patience,
                 head_patience=args.head_patience,
                 seed=args.seed,

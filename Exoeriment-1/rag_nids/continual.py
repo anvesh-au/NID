@@ -286,8 +286,13 @@ def _evaluate_session(
 def _train_session_model(
     encoder: Optional[FlowEncoder],
     head: Optional[CrossAttentionHead],
+    index: Optional[FlowIndex],
     train_X: np.ndarray,
     train_y: np.ndarray,
+    session_X: np.ndarray,
+    session_y: np.ndarray,
+    index_rebuild_X: np.ndarray,
+    index_rebuild_y: np.ndarray,
     num_classes: int,
     embed_dim: int,
     k: int,
@@ -304,36 +309,51 @@ def _train_session_model(
     focal_gamma: float,
     ce_class_weights: Optional[torch.Tensor],
     faiss_device: str,
+    train_encoder_this_session: bool,
     enc_patience: Optional[int],
     head_patience: Optional[int],
     seed: int,
 ) -> tuple[FlowEncoder, CrossAttentionHead, FlowIndex, RAGNIDS]:
-    init_encoder = encoder
-    init_aux = None
-    if encoder is not None and head is not None:
-        # Warm-start the auxiliary classifier with the previous class space.
-        init_aux = nn.Linear(encoder.embed_dim, num_classes, bias=True).to(device)
-        with torch.no_grad():
-            init_aux.weight.zero_()
-            init_aux.bias.zero_()
-            old_n = min(head.cls.out_features, num_classes)
-            init_aux.weight[: old_n].copy_(head.cls.weight[: old_n])
-            if head.cls.bias is not None:
-                init_aux.bias[: old_n].copy_(head.cls.bias[: old_n])
+    if train_encoder_this_session:
+        init_encoder = encoder
+        init_aux = None
+        if encoder is not None and head is not None:
+            # Warm-start the auxiliary classifier with the previous class space.
+            init_aux = nn.Linear(encoder.embed_dim, num_classes, bias=True).to(device)
+            with torch.no_grad():
+                init_aux.weight.zero_()
+                init_aux.bias.zero_()
+                old_n = min(head.cls.out_features, num_classes)
+                init_aux.weight[: old_n].copy_(head.cls.weight[: old_n])
+                if head.cls.bias is not None:
+                    init_aux.bias[: old_n].copy_(head.cls.bias[: old_n])
 
-    trained_encoder = train_encoder(
-        train_X, train_y, num_classes=num_classes,
-        embed_dim=embed_dim, epochs=enc_epochs, lr=enc_lr,
-        supcon_weight=supcon_weight, ce_weight=ce_weight,
-        temperature=temperature, device=device,
-        ce_class_weights=ce_class_weights, init_encoder=init_encoder,
-        init_aux_head=init_aux, patience=enc_patience, val_frac=0.0, seed=seed,
-    )
+        trained_encoder = train_encoder(
+            train_X, train_y, num_classes=num_classes,
+            embed_dim=embed_dim, epochs=enc_epochs, lr=enc_lr,
+            supcon_weight=supcon_weight, ce_weight=ce_weight,
+            temperature=temperature, device=device,
+            ce_class_weights=ce_class_weights, init_encoder=init_encoder,
+            init_aux_head=init_aux, patience=enc_patience, val_frac=0.0, seed=seed,
+        )
+    else:
+        if encoder is None:
+            raise ValueError("encoder is None while training is disabled for this session")
+        trained_encoder = encoder
 
-    index = build_index(
-        trained_encoder, train_X, train_y,
-        use_hnsw=False, device=device, faiss_device=faiss_device,
-    )
+    if index is None or train_encoder_this_session:
+        # If encoder changed (or no prior index), re-encode all seen data so index vectors stay consistent.
+        index = build_index(
+            trained_encoder, index_rebuild_X, index_rebuild_y,
+            use_hnsw=False, device=device, faiss_device=faiss_device,
+        )
+    else:
+        # Encoder is frozen: retain old database and append only current-session train rows.
+        append_index = build_index(
+            trained_encoder, session_X, session_y,
+            use_hnsw=False, device=device, faiss_device=faiss_device,
+        )
+        index.add(append_index.embeddings, append_index.labels)
 
     init_head = _expand_head(head, num_classes) if head is not None else None
     trained_head = train_head(
@@ -365,6 +385,7 @@ def run_continual_sessions(
     focal_gamma: float = 2.0,
     replay_per_class: int = 50,
     faiss_device: str = "cpu",
+    encoder_first_session_only: bool = False,
     enc_patience: Optional[int] = None,
     head_patience: Optional[int] = None,
     seed: int = 0,
@@ -383,8 +404,11 @@ def run_continual_sessions(
     preprocessor: Optional[FeaturePreprocessor] = None
     encoder: Optional[FlowEncoder] = None
     head: Optional[CrossAttentionHead] = None
+    index: Optional[FlowIndex] = None
     history_tests: list[tuple[str, np.ndarray, np.ndarray]] = []
     results: list[SessionResult] = []
+    seen_train_X: Optional[np.ndarray] = None
+    seen_train_y: Optional[np.ndarray] = None
 
     for session_idx, session in enumerate(sessions):
         print(f"[session] loading {session.name} from {session.csv_dir}")
@@ -406,15 +430,28 @@ def run_continual_sessions(
 
         num_classes = label_space.num_classes
         ce_w = ce_class_weights(train_y, num_classes=num_classes)
+        train_encoder_this_session = (session_idx == 0) or (not encoder_first_session_only)
+        encoder_mode = "train" if train_encoder_this_session else "frozen"
+
+        # Track all seen train rows (without replay duplicates) for index rebuilds when encoder changes.
+        if seen_train_X is None:
+            seen_train_X = X_tr.copy()
+            seen_train_y = y_tr.copy()
+        else:
+            seen_train_X = np.concatenate([seen_train_X, X_tr], axis=0)
+            seen_train_y = np.concatenate([seen_train_y, y_tr], axis=0)
+
         print(f"[session] {session.name}: train={len(train_X)} test={len(X_te)} "
-              f"classes={num_classes} faiss_device={faiss_device}")
+              f"classes={num_classes} faiss_device={faiss_device} encoder={encoder_mode}")
 
         encoder, head, index, model = _train_session_model(
-            encoder, head, train_X, train_y, num_classes=num_classes, embed_dim=embed_dim,
+            encoder, head, index, train_X, train_y, X_tr, y_tr,
+            seen_train_X, seen_train_y, num_classes=num_classes, embed_dim=embed_dim,
             k=k, device=device, enc_epochs=enc_epochs, head_epochs=head_epochs,
             enc_lr=enc_lr, head_lr=head_lr, n_heads=n_heads, supcon_weight=supcon_weight,
             ce_weight=ce_weight, temperature=temperature, loss_name=loss_name,
             focal_gamma=focal_gamma, ce_class_weights=ce_w, faiss_device=faiss_device,
+            train_encoder_this_session=train_encoder_this_session,
             enc_patience=enc_patience, head_patience=head_patience, seed=seed + session_idx,
         )
 
