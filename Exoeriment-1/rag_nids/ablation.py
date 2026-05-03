@@ -297,14 +297,65 @@ def run_full_ablation(
     loss_name: str = "ce",
     focal_gamma: float = 2.0,
     recency_alpha: float = 0.0,
+    split_mode: str = "random",
+    temporal_manifest_path: Optional[str | Path] = None,
+    temporal_test_session_idx: int = -1,
 ) -> pd.DataFrame:
     out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    X, y, _, _, label_enc = load_cic_ids2017(data_dir, subsample=subsample, seed=seed)
-    label_names = list(label_enc.classes_)
-    n_classes = int(np.max(y)) + 1
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_size, stratify=y, random_state=seed)
+    if split_mode == "temporal":
+        if temporal_manifest_path is None:
+            raise ValueError("split_mode='temporal' requires temporal_manifest_path")
+        sessions = _load_manifest(temporal_manifest_path)
+        if not sessions:
+            raise ValueError("Temporal manifest did not contain any sessions")
+        test_idx = temporal_test_session_idx if temporal_test_session_idx >= 0 else (len(sessions) - 1)
+        if not (0 <= test_idx < len(sessions)):
+            raise ValueError(f"temporal_test_session_idx={temporal_test_session_idx} out of range for {len(sessions)} sessions")
+        if len(sessions) < 2:
+            raise ValueError("Temporal split requires at least 2 sessions")
+
+        preprocessor = None
+        X_train_parts: list[np.ndarray] = []
+        y_train_raw_parts: list[np.ndarray] = []
+        X_test = None
+        y_test_raw = None
+
+        for i, session in enumerate(sessions):
+            if preprocessor is None:
+                preprocessor, X_df, y_raw = _fit_preprocessor(session.csv_dir, session.subsample, seed)
+                X = preprocessor.transform(X_df)
+            else:
+                X, y_raw = _load_with_preprocessor(session.csv_dir, preprocessor, session.subsample, seed)
+            if i == test_idx:
+                X_test = X
+                y_test_raw = y_raw
+            else:
+                X_train_parts.append(X)
+                y_train_raw_parts.append(y_raw)
+
+        if X_test is None or y_test_raw is None:
+            raise RuntimeError("Temporal split failed to collect test session")
+        X_tr = np.concatenate(X_train_parts, axis=0).astype(np.float32)
+        y_tr_raw = np.concatenate(y_train_raw_parts, axis=0)
+
+        label_names = sorted(np.unique(y_tr_raw).tolist())
+        label_to_id = {name: i for i, name in enumerate(label_names)}
+        y_tr = np.asarray([label_to_id[v] for v in y_tr_raw], dtype=np.int64)
+        known_mask = np.asarray([v in label_to_id for v in y_test_raw], dtype=bool)
+        dropped = int((~known_mask).sum())
+        if dropped > 0:
+            print(f"[ablation/full] temporal split dropped {dropped} test rows with unseen labels.")
+        y_te_raw_known = y_test_raw[known_mask]
+        X_te = X_test[known_mask].astype(np.float32)
+        y_te = np.asarray([label_to_id[v] for v in y_te_raw_known], dtype=np.int64)
+        n_classes = len(label_names)
+    else:
+        X, y, _, _, label_enc = load_cic_ids2017(data_dir, subsample=subsample, seed=seed)
+        label_names = list(label_enc.classes_)
+        n_classes = int(np.max(y)) + 1
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_size, stratify=y, random_state=seed)
     labels = np.arange(n_classes)
     rows: list[AblationRow] = []
 
@@ -410,7 +461,160 @@ def run_full_ablation(
         "seed": seed,
         "test_size": test_size,
         "subsample": subsample,
+        "split_mode": split_mode,
+        "temporal_manifest_path": str(temporal_manifest_path) if temporal_manifest_path is not None else None,
+        "temporal_test_session_idx": temporal_test_session_idx,
         "embed_dim": embed_dim,
         "k": k,
     }, indent=2))
+    return df
+
+
+def run_continual_full_ablation(
+    manifest_path: str | Path,
+    output_dir: str | Path,
+    device: str = "cpu",
+    faiss_device: str = "cpu",
+    test_size: float = 0.2,
+    embed_dim: int = 64,
+    k: int = 10,
+    enc_epochs: int = 10,
+    head_epochs: int = 5,
+    enc_lr: float = 1e-3,
+    head_lr: float = 1e-3,
+    supcon_weight: float = 1.0,
+    ce_weight: float = 0.3,
+    temperature: float = 0.1,
+    n_heads: int = 4,
+    loss_name: str = "ce",
+    focal_gamma: float = 2.0,
+    replay_per_class: int = 50,
+    seed: int = 0,
+    recency_alpha: float = 0.0,
+    encoder_first_session_only: bool = False,
+) -> pd.DataFrame:
+    if not _HAS_XGBOOST:
+        raise ImportError("xgboost is required for continual_full ablation; please install xgboost.")
+
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    sessions = _load_manifest(manifest_path)
+    label_space = LabelSpace()
+    replay = ReplayBuffer()
+    preprocessor = None
+    seen_X: Optional[np.ndarray] = None
+    seen_y: Optional[np.ndarray] = None
+    encoder: Optional[FlowEncoder] = None
+    rows: list[AblationRow] = []
+
+    for session_idx, session in enumerate(sessions):
+        if preprocessor is None:
+            preprocessor, X_df, y_raw = _fit_preprocessor(session.csv_dir, session.subsample, seed)
+            X = preprocessor.transform(X_df)
+        else:
+            X, y_raw = _load_with_preprocessor(session.csv_dir, preprocessor, session.subsample, seed)
+        label_space.add_many(y_raw)
+        y = label_space.encode(y_raw)
+        X_tr, X_te, y_tr, y_te = _safe_split(X, y, test_size=test_size, seed=seed + session_idx)
+        replay_X, replay_y = replay.as_arrays()
+        if replay_y.size > 0:
+            train_X = np.concatenate([X_tr, replay_X], axis=0)
+            train_y = np.concatenate([y_tr, replay_y], axis=0)
+        else:
+            train_X, train_y = X_tr, y_tr
+        num_classes = label_space.num_classes
+        labels = np.arange(num_classes)
+        label_names = label_space.id_to_label.copy()
+
+        # B1: plain xgboost on raw features
+        t0 = time.time()
+        xgb_plain = XGBClassifier(
+            n_estimators=300, max_depth=8, learning_rate=0.08,
+            subsample=0.9, colsample_bytree=0.9,
+            objective="multi:softmax", num_class=num_classes,
+            tree_method="hist", random_state=seed + session_idx, n_jobs=-1,
+        )
+        xgb_plain.fit(train_X, train_y)
+        tr_secs = time.time() - t0
+        t1 = time.time(); p = xgb_plain.predict(X_te); inf_secs = time.time() - t1
+        m = _metrics(y_te, p, labels=labels)
+        rows.append(AblationRow("continual_full", "plain_xgboost", session.name, seed, m["accuracy"], m["precision_macro"], m["recall_macro"], m["f1_macro"], m["f1_weighted"], tr_secs, inf_secs))
+        _write_eval_artifacts(out_root / "artifacts", "plain_xgboost", session.name, label_names, y_te, p)
+
+        # Encoder train/update for B2/B3/B4
+        do_train_encoder = (session_idx == 0) or (not encoder_first_session_only)
+        if do_train_encoder:
+            cw = ce_class_weights(train_y, num_classes=num_classes)
+            encoder = train_encoder(
+                train_X, train_y, num_classes=num_classes,
+                embed_dim=embed_dim, epochs=enc_epochs, lr=enc_lr,
+                supcon_weight=supcon_weight, ce_weight=ce_weight,
+                temperature=temperature, device=device, ce_class_weights=cw,
+                init_encoder=encoder, init_aux_head=None, patience=None, val_frac=0.0, seed=seed + session_idx,
+            )
+        if encoder is None:
+            raise RuntimeError("Encoder not initialized")
+        Z_tr = _encode_array(encoder, train_X, device=device)
+        Z_te = _encode_array(encoder, X_te, device=device)
+
+        # B2: encoder + linear
+        t0 = time.time()
+        lin = LogisticRegression(max_iter=1000, multi_class="multinomial")
+        lin.fit(Z_tr, train_y)
+        tr_secs = time.time() - t0
+        t1 = time.time(); p = lin.predict(Z_te); inf_secs = time.time() - t1
+        m = _metrics(y_te, p, labels=labels)
+        rows.append(AblationRow("continual_full", "encoder_linear", session.name, seed, m["accuracy"], m["precision_macro"], m["recall_macro"], m["f1_macro"], m["f1_weighted"], tr_secs, inf_secs))
+        _write_eval_artifacts(out_root / "artifacts", "encoder_linear", session.name, label_names, y_te, p)
+
+        # B3: encoder + xgboost
+        t0 = time.time()
+        xgb_emb = XGBClassifier(
+            n_estimators=300, max_depth=6, learning_rate=0.08,
+            subsample=0.9, colsample_bytree=0.9,
+            objective="multi:softmax", num_class=num_classes,
+            tree_method="hist", random_state=seed + session_idx, n_jobs=-1,
+        )
+        xgb_emb.fit(Z_tr, train_y)
+        tr_secs = time.time() - t0
+        t1 = time.time(); p = xgb_emb.predict(Z_te); inf_secs = time.time() - t1
+        m = _metrics(y_te, p, labels=labels)
+        rows.append(AblationRow("continual_full", "encoder_xgboost", session.name, seed, m["accuracy"], m["precision_macro"], m["recall_macro"], m["f1_macro"], m["f1_weighted"], tr_secs, inf_secs))
+        _write_eval_artifacts(out_root / "artifacts", "encoder_xgboost", session.name, label_names, y_te, p)
+
+        # B4: encoder + retrieval + attention
+        if seen_X is None:
+            seen_X = X_tr.copy(); seen_y = y_tr.copy()
+        else:
+            seen_X = np.concatenate([seen_X, X_tr], axis=0)
+            seen_y = np.concatenate([seen_y, y_tr], axis=0)
+        cw = ce_class_weights(train_y, num_classes=num_classes)
+        t0 = time.time()
+        index = build_index(encoder, seen_X if do_train_encoder else train_X, seen_y if do_train_encoder else train_y, use_hnsw=False, device=device, faiss_device=faiss_device)
+        head = train_head(
+            encoder, index, train_X, train_y, num_classes=num_classes, k=k, n_heads=n_heads,
+            epochs=head_epochs, lr=head_lr, device=device, val=None,
+            ce_class_weights=cw, loss_name=loss_name, focal_gamma=focal_gamma,
+            recency_alpha=recency_alpha,
+        )
+        model = RAGNIDS(encoder, head, index, k=k, recency_alpha=recency_alpha).to(device)
+        tr_secs = time.time() - t0
+        t1 = time.time()
+        pred = []
+        with torch.no_grad():
+            for i in range(0, len(X_te), 4096):
+                xb = torch.from_numpy(X_te[i:i + 4096]).to(device)
+                logits, *_ = model(xb, exclude_self=False)
+                pred.append(logits.argmax(-1).cpu().numpy())
+        p = np.concatenate(pred, axis=0); inf_secs = time.time() - t1
+        m = _metrics(y_te, p, labels=labels)
+        rows.append(AblationRow("continual_full", "encoder_retrieval_attention", session.name, seed, m["accuracy"], m["precision_macro"], m["recall_macro"], m["f1_macro"], m["f1_weighted"], tr_secs, inf_secs))
+        _write_eval_artifacts(out_root / "artifacts", "encoder_retrieval_attention", session.name, label_names, y_te, p)
+
+        replay.append(X_tr, y_tr)
+        replay.cap_per_class(replay_per_class, seed=seed + session_idx)
+
+    df = pd.DataFrame([asdict(r) for r in rows])
+    df.to_csv(out_root / "ablation_continual_full_summary.csv", index=False)
     return df
