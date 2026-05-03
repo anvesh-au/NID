@@ -60,6 +60,10 @@ class SessionResult:
     num_classes: int
     per_class: pd.DataFrame
     confusion_rates: pd.DataFrame
+    cumulative_accuracy: float
+    cumulative_precision_macro: float
+    cumulative_recall_macro: float
+    cumulative_f1_macro: float
     label_names: list[str]
 
 
@@ -473,6 +477,10 @@ def run_continual_sessions(
             num_classes=num_classes,
             per_class=per_class,
             confusion_rates=metrics["confusion_rates"],
+            cumulative_accuracy=0.0,
+            cumulative_precision_macro=0.0,
+            cumulative_recall_macro=0.0,
+            cumulative_f1_macro=0.0,
             label_names=label_space.id_to_label.copy(),
         )
         results.append(result)
@@ -485,6 +493,23 @@ def run_continual_sessions(
         print(per_class.to_string(index=False))
         print("[confusion matrix] row-normalized rates (per-class recall):")
         print(result.confusion_rates.round(4).to_string())
+
+        # Cumulative evaluation on all test splits observed so far, including current session.
+        cumulative_tests = history_tests + [(session.name, X_te, y_te)]
+        cum_X = np.concatenate([x for _, x, _ in cumulative_tests], axis=0)
+        cum_y = np.concatenate([y_ for _, _, y_ in cumulative_tests], axis=0)
+        cum_metrics, _ = _evaluate_session(model, cum_X, cum_y, label_space.id_to_label, device=device)
+        result.cumulative_accuracy = cum_metrics["accuracy"]
+        result.cumulative_precision_macro = cum_metrics["precision_macro"]
+        result.cumulative_recall_macro = cum_metrics["recall_macro"]
+        result.cumulative_f1_macro = cum_metrics["f1_macro"]
+        print(
+            f"[session] cumulative_through_{session.name}: "
+            f"acc={result.cumulative_accuracy:.4f} "
+            f"prec={result.cumulative_precision_macro:.4f} "
+            f"rec={result.cumulative_recall_macro:.4f} "
+            f"f1={result.cumulative_f1_macro:.4f}"
+        )
 
         if _HAS_MLFLOW and mlflow.active_run() is not None:  # pragma: no cover
             mlflow.log_metrics({
@@ -508,6 +533,10 @@ def run_continual_sessions(
                 "precision_macro": result.precision_macro,
                 "recall_macro": result.recall_macro,
                 "f1_macro": result.f1_macro,
+                "cumulative_accuracy": result.cumulative_accuracy,
+                "cumulative_precision_macro": result.cumulative_precision_macro,
+                "cumulative_recall_macro": result.cumulative_recall_macro,
+                "cumulative_f1_macro": result.cumulative_f1_macro,
             }]).to_csv(session_dir / "summary.csv", index=False)
 
         if history_tests:
@@ -545,6 +574,10 @@ def run_continual_sessions(
             "precision_macro": r.precision_macro,
             "recall_macro": r.recall_macro,
             "f1_macro": r.f1_macro,
+            "cumulative_accuracy": r.cumulative_accuracy,
+            "cumulative_precision_macro": r.cumulative_precision_macro,
+            "cumulative_recall_macro": r.cumulative_recall_macro,
+            "cumulative_f1_macro": r.cumulative_f1_macro,
         } for r in results])
         summary.to_csv(out_root / "session_summary.csv", index=False)
 
